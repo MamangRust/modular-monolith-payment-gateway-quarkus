@@ -1,0 +1,15 @@
+package com.sanedge.topup.service.stats.amount;
+
+import java.util.List;
+
+import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.topup.domain.response.stats.amount.TopupMonthAmountResponse;
+import com.sanedge.topup.domain.response.stats.amount.TopupYearlyAmountResponse;
+
+import io.smallrye.mutiny.Uni;
+
+public interface TopupAmountService {
+    Uni<ApiResponse<List<TopupMonthAmountResponse>>> findMonthlyAmounts(Long year);
+
+    Uni<ApiResponse<List<TopupYearlyAmountResponse>>> findYearlyAmounts(Long year);
+}

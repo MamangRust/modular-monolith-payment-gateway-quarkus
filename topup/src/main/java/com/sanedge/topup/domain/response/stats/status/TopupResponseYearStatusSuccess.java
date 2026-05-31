@@ -1,0 +1,26 @@
+package com.sanedge.topup.domain.response.stats.status;
+
+import com.sanedge.topup.entity.TopupYearStatusSuccess;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class TopupResponseYearStatusSuccess {
+    private String reportYear;
+    private Long totalAmount;
+    private Long totalSuccess;
+
+    public static TopupResponseYearStatusSuccess from(TopupYearStatusSuccess dto) {
+        return TopupResponseYearStatusSuccess.builder()
+                .reportYear(dto.getYear())
+                .totalAmount(dto.getTotalAmount().longValue())
+                .totalSuccess(dto.getTotalSuccess().longValue())
+                .build();
+    }
+}
