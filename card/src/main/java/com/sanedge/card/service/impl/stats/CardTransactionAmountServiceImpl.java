@@ -12,6 +12,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sanedge.common.config.RedisService;
 import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.observability.TracingMetrics;
+
 import com.sanedge.card.domain.response.stats.amount.CardResponseMonthAmount;
 import com.sanedge.card.domain.response.stats.amount.CardResponseYearAmount;
 import com.sanedge.card.repository.stats.CardTransactionAmountRepository;
@@ -64,6 +66,14 @@ public class CardTransactionAmountServiceImpl implements CardTransactionAmountSe
                 .setUnit("s")
                 .build();
     }
+    public CardTransactionAmountServiceImpl(CardTransactionAmountRepository cardTransactionAmountRepository,
+            RedisService redisService,
+            ObjectMapper objectMapper,
+            TracingMetrics tracingMetrics) {
+        this(cardTransactionAmountRepository, OpenTelemetry.noop(), redisService, objectMapper);
+    }
+
+
 
     private String toJson(Object obj) {
         try {

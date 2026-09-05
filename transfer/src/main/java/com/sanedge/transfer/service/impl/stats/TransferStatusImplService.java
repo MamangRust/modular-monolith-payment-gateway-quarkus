@@ -13,6 +13,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sanedge.common.config.RedisService;
 import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.transfer.domain.requests.stats.MonthStatusTransfer;
 import com.sanedge.transfer.domain.response.stats.status.TransferResponseMonthStatusFailed;
 import com.sanedge.transfer.domain.response.stats.status.TransferResponseMonthStatusSuccess;
@@ -21,16 +22,7 @@ import com.sanedge.transfer.domain.response.stats.status.TransferResponseYearSta
 import com.sanedge.transfer.repository.stats.TransferStatusRepository;
 import com.sanedge.transfer.service.stats.status.TransferStatusService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -42,10 +34,7 @@ public class TransferStatusImplService implements TransferStatusService {
     private final TransferStatusRepository transferStatusRepository;
     private final RedisService redisService;
     private final ObjectMapper objectMapper;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
@@ -53,20 +42,11 @@ public class TransferStatusImplService implements TransferStatusService {
     public TransferStatusImplService(TransferStatusRepository transferStatusRepository,
                                      RedisService redisService,
                                      ObjectMapper objectMapper,
-                                     OpenTelemetry openTelemetry) {
+                                     TracingMetrics tracingMetrics) {
         this.transferStatusRepository = transferStatusRepository;
         this.redisService = redisService;
         this.objectMapper = objectMapper;
-        this.tracer = openTelemetry.getTracer("transfer-status-stats-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("transfer-status-stats-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     private String toJson(Object obj) {
@@ -109,6 +89,12 @@ public class TransferStatusImplService implements TransferStatusService {
 
         String cacheKey = String.format("transfers:stats:status:month:success:%d:%d", year, month);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_month_status_success")
+                .put("year", String.valueOf(year))
+                .put("month", String.valueOf(month))
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -120,51 +106,24 @@ public class TransferStatusImplService implements TransferStatusService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findMonthTransferStatusSuccess")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-status-stats-service")
-                            .setAttribute("operation", "find_month_status_success")
-                            .setAttribute("year", String.valueOf(year))
-                            .setAttribute("month", String.valueOf(month))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findMonthTransferStatusSuccess", "find_month_status_success", attrs,
+                            () -> {
+                                LocalDate currentMonth = LocalDate.of(year.intValue(), month, 1);
+                                LocalDate nextMonth = currentMonth.plusMonths(1);
 
-                    LocalDate currentMonth = LocalDate.of(year.intValue(), month, 1);
-                    LocalDate nextMonth = currentMonth.plusMonths(1);
+                                return transferStatusRepository.findMonthTransferStatusSuccess(year, month, (long) nextMonth.getYear(), nextMonth.getMonthValue())
+                                        .chain(results -> {
+                                            List<TransferResponseMonthStatusSuccess> response = results.stream()
+                                                    .map(TransferResponseMonthStatusSuccess::from)
+                                                    .collect(Collectors.toList());
 
-                    return transferStatusRepository.findMonthTransferStatusSuccess(year, month, (long) nextMonth.getYear(), nextMonth.getMonthValue())
-                            .chain(results -> {
-                                List<TransferResponseMonthStatusSuccess> response = results.stream()
-                                        .map(TransferResponseMonthStatusSuccess::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_month_status_success",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Monthly SUCCESS transfer status fetched successfully", response);
+                                            return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                                    .map(v -> ApiResponse.success("Monthly SUCCESS transfer status fetched successfully", response));
+                                        })
+                                        .onFailure().recoverWithItem(e -> {
+                                            logger.error("❌ Failed to fetch monthly SUCCESS transfer status for year={}, month={}", year, month, e);
+                                            return new ApiResponse<>("error", "Failed to retrieve monthly SUCCESS transfer status", Collections.emptyList());
                                         });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("❌ Failed to fetch monthly SUCCESS transfer status for year={}, month={}", year, month, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_status_success",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to retrieve monthly SUCCESS transfer status", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_status_success"));
                             });
                 });
     }
@@ -183,6 +142,12 @@ public class TransferStatusImplService implements TransferStatusService {
 
         String cacheKey = String.format("transfers:stats:status:month:failed:%d:%d", year, month);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_month_status_failed")
+                .put("year", String.valueOf(year))
+                .put("month", String.valueOf(month))
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -194,51 +159,24 @@ public class TransferStatusImplService implements TransferStatusService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findMonthTransferStatusFailed")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-status-stats-service")
-                            .setAttribute("operation", "find_month_status_failed")
-                            .setAttribute("year", String.valueOf(year))
-                            .setAttribute("month", String.valueOf(month))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findMonthTransferStatusFailed", "find_month_status_failed", attrs,
+                            () -> {
+                                LocalDate currentMonth = LocalDate.of(year.intValue(), month, 1);
+                                LocalDate nextMonth = currentMonth.plusMonths(1);
 
-                    LocalDate currentMonth = LocalDate.of(year.intValue(), month, 1);
-                    LocalDate nextMonth = currentMonth.plusMonths(1);
+                                return transferStatusRepository.findMonthTransferStatusFailed(year, month, (long) nextMonth.getYear(), nextMonth.getMonthValue())
+                                        .chain(results -> {
+                                            List<TransferResponseMonthStatusFailed> response = results.stream()
+                                                    .map(TransferResponseMonthStatusFailed::from)
+                                                    .collect(Collectors.toList());
 
-                    return transferStatusRepository.findMonthTransferStatusFailed(year, month, (long) nextMonth.getYear(), nextMonth.getMonthValue())
-                            .chain(results -> {
-                                List<TransferResponseMonthStatusFailed> response = results.stream()
-                                        .map(TransferResponseMonthStatusFailed::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_month_status_failed",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Monthly FAILED transfer status fetched successfully", response);
+                                            return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                                    .map(v -> ApiResponse.success("Monthly FAILED transfer status fetched successfully", response));
+                                        })
+                                        .onFailure().recoverWithItem(e -> {
+                                            logger.error("❌ Failed to fetch monthly FAILED transfer status for year={}, month={}", year, month, e);
+                                            return new ApiResponse<>("error", "Failed to retrieve monthly FAILED transfer status", Collections.emptyList());
                                         });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("❌ Failed to fetch monthly FAILED transfer status for year={}, month={}", year, month, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_status_failed",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to retrieve monthly FAILED transfer status", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_status_failed"));
                             });
                 });
     }
@@ -254,6 +192,11 @@ public class TransferStatusImplService implements TransferStatusService {
 
         String cacheKey = String.format("transfers:stats:status:year:success:%d", year);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_yearly_status_success")
+                .put("year", String.valueOf(year))
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -265,48 +208,20 @@ public class TransferStatusImplService implements TransferStatusService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findYearlyTransferStatusSuccess")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-status-stats-service")
-                            .setAttribute("operation", "find_yearly_status_success")
-                            .setAttribute("year", String.valueOf(year))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findYearlyTransferStatusSuccess", "find_yearly_status_success", attrs,
+                            () -> transferStatusRepository.findYearlyTransferStatusSuccess(year)
+                                    .chain(results -> {
+                                        List<TransferResponseYearStatusSuccess> response = results.stream()
+                                                .map(TransferResponseYearStatusSuccess::from)
+                                                .collect(Collectors.toList());
 
-                    return transferStatusRepository.findYearlyTransferStatusSuccess(year)
-                            .chain(results -> {
-                                List<TransferResponseYearStatusSuccess> response = results.stream()
-                                        .map(TransferResponseYearStatusSuccess::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_yearly_status_success",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Yearly SUCCESS transfer status fetched successfully", response);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("❌ Failed to fetch yearly SUCCESS transfer status for year={}", year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_status_success",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to retrieve yearly SUCCESS transfer status", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_status_success"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success("Yearly SUCCESS transfer status fetched successfully", response));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("❌ Failed to fetch yearly SUCCESS transfer status for year={}", year, e);
+                                        return new ApiResponse<>("error", "Failed to retrieve yearly SUCCESS transfer status", Collections.emptyList());
+                                    }));
                 });
     }
 
@@ -321,6 +236,11 @@ public class TransferStatusImplService implements TransferStatusService {
 
         String cacheKey = String.format("transfers:stats:status:year:failed:%d", year);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_yearly_status_failed")
+                .put("year", String.valueOf(year))
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -332,48 +252,20 @@ public class TransferStatusImplService implements TransferStatusService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findYearlyTransferStatusFailed")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-status-stats-service")
-                            .setAttribute("operation", "find_yearly_status_failed")
-                            .setAttribute("year", String.valueOf(year))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findYearlyTransferStatusFailed", "find_yearly_status_failed", attrs,
+                            () -> transferStatusRepository.findYearlyTransferStatusFailed(year)
+                                    .chain(results -> {
+                                        List<TransferResponseYearStatusFailed> response = results.stream()
+                                                .map(TransferResponseYearStatusFailed::from)
+                                                .collect(Collectors.toList());
 
-                    return transferStatusRepository.findYearlyTransferStatusFailed(year)
-                            .chain(results -> {
-                                List<TransferResponseYearStatusFailed> response = results.stream()
-                                        .map(TransferResponseYearStatusFailed::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_yearly_status_failed",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Yearly FAILED transfer status fetched successfully", response);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("❌ Failed to fetch yearly FAILED transfer status for year={}", year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_status_failed",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to retrieve yearly FAILED transfer status", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_status_failed"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success("Yearly FAILED transfer status fetched successfully", response));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("❌ Failed to fetch yearly FAILED transfer status for year={}", year, e);
+                                        return new ApiResponse<>("error", "Failed to retrieve yearly FAILED transfer status", Collections.emptyList());
+                                    }));
                 });
     }
 }

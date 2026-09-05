@@ -22,6 +22,7 @@ import com.sanedge.topup.domain.response.stats.status.TopupResponseYearStatusSuc
 import com.sanedge.topup.repository.statsbycard.TopupStatusByCardRepository;
 import com.sanedge.topup.service.stats.status.TopupStatusByCardService;
 
+import com.sanedge.common.observability.TracingMetrics;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
@@ -50,7 +51,14 @@ public class TopupStatusByCardServiceImpl implements TopupStatusByCardService {
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
-    @Inject
+        public TopupStatusByCardServiceImpl(TopupStatusByCardRepository topupStatusByCardRepository,
+            RedisService redisService,
+            ObjectMapper objectMapper,
+            TracingMetrics tracingMetrics) {
+        this(topupStatusByCardRepository, redisService, objectMapper, OpenTelemetry.noop());
+    }
+
+@Inject
     public TopupStatusByCardServiceImpl(TopupStatusByCardRepository topupStatusByCardRepository,
                                         RedisService redisService,
                                         ObjectMapper objectMapper,
@@ -151,7 +159,7 @@ public class TopupStatusByCardServiceImpl implements TopupStatusByCardService {
                     LocalDate currentMonth = LocalDate.of(year.intValue(), month, 1);
                     LocalDate nextMonth = currentMonth.plusMonths(1);
 
-                    return topupStatusByCardRepository.findMonthTopupStatusSuccessByCard(cardNumber, year, month, (long) nextMonth.getYear(), nextMonth.getMonthValue())
+                    return topupStatusByCardRepository.findMonthTopupStatusSuccessByCard(req)
                             .chain(data -> {
                                 List<TopupResponseMonthStatusSuccess> responseList = data.stream()
                                         .map(TopupResponseMonthStatusSuccess::from)
@@ -300,7 +308,7 @@ public class TopupStatusByCardServiceImpl implements TopupStatusByCardService {
                     LocalDate currentMonth = LocalDate.of(year.intValue(), month, 1);
                     LocalDate nextMonth = currentMonth.plusMonths(1);
 
-                    return topupStatusByCardRepository.findMonthTopupStatusFailedByCard(cardNumber, year, month, (long) nextMonth.getYear(), nextMonth.getMonthValue())
+                    return topupStatusByCardRepository.findMonthTopupStatusFailedByCard(req)
                             .chain(data -> {
                                 List<TopupResponseMonthStatusFailed> responseList = data.stream()
                                         .map(TopupResponseMonthStatusFailed::from)

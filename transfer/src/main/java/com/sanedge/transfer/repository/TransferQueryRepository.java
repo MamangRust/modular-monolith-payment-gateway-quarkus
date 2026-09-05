@@ -3,6 +3,7 @@ package com.sanedge.transfer.repository;
 import java.util.List;
 
 import com.sanedge.common.domain.response.PagedResult;
+import com.sanedge.transfer.domain.requests.FindAllTransfers;
 import com.sanedge.transfer.entity.Transfer;
 
 import io.quarkus.hibernate.reactive.panache.PanacheRepository;
@@ -13,7 +14,11 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class TransferQueryRepository implements PanacheRepository<Transfer> {
 
-    public Uni<PagedResult<Transfer>> findTransfers(String search, int page, int size) {
+    public Uni<PagedResult<Transfer>> findTransfers(FindAllTransfers req) {
+        String search = req.getSearch() != null && !req.getSearch().isEmpty() ? req.getSearch() : null;
+        int page = req.getPage() > 0 ? req.getPage() - 1 : 0;
+        int size = req.getPageSize() > 0 ? req.getPageSize() : 10;
+
         var query = """
                     deletedAt IS NULL
                     AND (
@@ -32,11 +37,15 @@ public class TransferQueryRepository implements PanacheRepository<Transfer> {
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
     }
 
-    public Uni<PagedResult<Transfer>> findActiveTransfers(String search, int page, int size) {
-        return findTransfers(search, page, size);
+    public Uni<PagedResult<Transfer>> findActiveTransfers(FindAllTransfers req) {
+        return findTransfers(req);
     }
 
-    public Uni<PagedResult<Transfer>> findTrashedTransfers(String search, int page, int size) {
+    public Uni<PagedResult<Transfer>> findTrashedTransfers(FindAllTransfers req) {
+        String search = req.getSearch() != null && !req.getSearch().isEmpty() ? req.getSearch() : null;
+        int page = req.getPage() > 0 ? req.getPage() - 1 : 0;
+        int size = req.getPageSize() > 0 ? req.getPageSize() : 10;
+
         var query = """
                     deletedAt IS NOT NULL
                     AND (
@@ -69,5 +78,9 @@ public class TransferQueryRepository implements PanacheRepository<Transfer> {
 
     public Uni<List<Transfer>> findTransfersByDestinationCard(String cardNumber) {
         return list("deletedAt IS NULL AND transferTo = ?1", Sort.descending("transferTime"), cardNumber);
+    }
+
+    public Uni<List<Transfer>> findPendingCompensation(int maxAttempts) {
+        return find("compensationAttempts < ?1 AND deletedAt IS NULL", maxAttempts).list();
     }
 }

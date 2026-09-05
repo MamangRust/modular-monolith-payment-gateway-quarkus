@@ -26,6 +26,7 @@ import com.sanedge.topup.repository.TopupQueryRepository;
 import com.sanedge.topup.service.TopupCommandService;
 
 import io.opentelemetry.api.OpenTelemetry;
+import com.sanedge.common.observability.TracingMetrics;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.DoubleHistogram;
@@ -87,6 +88,22 @@ public class TopupCommandServiceImpl implements TopupCommandService {
                 .setDescription("Request duration in seconds")
                 .setUnit("s")
                 .build();
+    }
+
+    // Test-friendly overload: (services..., validator, redis, kafka, tracingMetrics) delegating
+    // to the @Inject constructor with a no-op OpenTelemetry (tracing stays inert under unit tests).
+    public TopupCommandServiceImpl(@GrpcClient("card") CardQueryService cardQueryService,
+                                  @GrpcClient("saldo") SaldoQueryService saldoQueryService,
+                                  @GrpcClient("saldo") SaldoCommandService saldoCommandService,
+                                  TopupQueryRepository topupQueryRepository,
+                                  TopupCommandRepository topupCommandRepository,
+                                  Validator validator,
+                                  RedisService redisService,
+                                  KafkaService kafkaService,
+                                  TracingMetrics tracingMetrics) {
+        this(cardQueryService, saldoQueryService, saldoCommandService,
+                topupQueryRepository, topupCommandRepository, validator,
+                OpenTelemetry.noop(), redisService, kafkaService);
     }
 
     private <T> boolean validateRequest(T req) {

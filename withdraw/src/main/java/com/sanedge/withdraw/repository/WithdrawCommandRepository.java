@@ -73,4 +73,89 @@ public class WithdrawCommandRepository implements PanacheRepository<Withdraw> {
         return delete("deletedAt IS NOT NULL")
                 .map(count -> count > 0);
     }
+
+    @WithTransaction
+    public Uni<Boolean> markCompensationRequired(Long withdrawId, String reason) {
+        return find("withdrawId = ?1 AND deletedAt IS NULL", withdrawId).firstResult()
+                .chain(w -> {
+                    if (w != null) {
+                        w.compensationAttempts = 1;
+                        w.compensationReason = reason;
+                        w.compensationWorkerId = null;
+                        w.compensationClaimToken = null;
+                        w.compensationLeaseUntil = null;
+                        w.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(w).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> claimCompensation(Long withdrawId, String workerId, String claimToken,
+            java.sql.Timestamp now, java.sql.Timestamp leaseUntil, int maxAttempts) {
+        return find("withdrawId = ?1 AND (compensationWorkerId IS NULL OR compensationLeaseUntil < ?2)",
+                withdrawId, now).firstResult()
+                .chain(w -> {
+                    if (w != null) {
+                        int attempts = w.compensationAttempts != null ? w.compensationAttempts : 0;
+                        if (attempts >= maxAttempts) return Uni.createFrom().item(false);
+                        w.compensationWorkerId = workerId;
+                        w.compensationClaimToken = claimToken;
+                        w.compensationLeaseUntil = leaseUntil;
+                        w.compensationAttempts = attempts + 1;
+                        w.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(w).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> completeCompensation(Long withdrawId, String workerId, String claimToken) {
+        return find("withdrawId = ?1 AND compensationClaimToken = ?2", withdrawId, claimToken).firstResult()
+                .chain(w -> {
+                    if (w != null && workerId.equals(w.compensationWorkerId)) {
+                        w.compensationWorkerId = null;
+                        w.compensationClaimToken = null;
+                        w.compensationLeaseUntil = null;
+                        w.status = com.sanedge.common.enums.Status.SUCCESS;
+                        w.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(w).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> releaseCompensation(Long withdrawId, String workerId, String claimToken,
+            java.sql.Timestamp leaseUntil, String reason) {
+        return find("withdrawId = ?1 AND compensationClaimToken = ?2", withdrawId, claimToken).firstResult()
+                .chain(w -> {
+                    if (w != null && workerId.equals(w.compensationWorkerId)) {
+                        w.compensationWorkerId = null;
+                        w.compensationClaimToken = null;
+                        w.compensationLeaseUntil = leaseUntil;
+                        w.compensationReason = reason;
+                        w.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(w).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> exhaustCompensation(Long withdrawId, int maxAttempts, String reason) {
+        return find("withdrawId = ?1", withdrawId).firstResult()
+                .chain(w -> {
+                    if (w != null) {
+                        w.compensationAttempts = maxAttempts;
+                        w.compensationReason = reason;
+                        w.status = com.sanedge.common.enums.Status.FAILED;
+                        w.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(w).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
 }

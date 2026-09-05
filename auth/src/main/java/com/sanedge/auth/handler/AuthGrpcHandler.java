@@ -29,7 +29,9 @@ public class AuthGrpcHandler extends pb.MutinyAuthServiceGrpc.AuthServiceImplBas
 
     @Override
     public Uni<ApiResponseVerifyCode> verifyCode(VerifyCodeRequest request) {
-        return authService.verifyEmailByCode(request.getCode())
+        return authService.verifyEmailByCode(com.sanedge.auth.domain.requests.VerifyCodeRequest.builder()
+                        .code(request.getCode())
+                        .build())
                 .map(v -> ApiResponseVerifyCode.newBuilder()
                         .setStatus("success")
                         .setMessage("Email verified successfully")
@@ -42,7 +44,9 @@ public class AuthGrpcHandler extends pb.MutinyAuthServiceGrpc.AuthServiceImplBas
 
     @Override
     public Uni<ApiResponseForgotPassword> forgotPassword(ForgotPasswordRequest request) {
-        return authService.forgotPassword(request.getEmail())
+        return authService.forgotPassword(com.sanedge.auth.domain.requests.ForgotPasswordRequest.builder()
+                        .email(request.getEmail())
+                        .build())
                 .map(v -> ApiResponseForgotPassword.newBuilder()
                         .setStatus("success")
                         .setMessage("Password reset email sent successfully")
@@ -55,7 +59,11 @@ public class AuthGrpcHandler extends pb.MutinyAuthServiceGrpc.AuthServiceImplBas
 
     @Override
     public Uni<ApiResponseResetPassword> resetPassword(ResetPasswordRequest request) {
-        return authService.resetPassword(request.getResetToken(), request.getPassword(), request.getConfirmPassword())
+        return authService.resetPassword(com.sanedge.auth.domain.requests.ResetPasswordRequest.builder()
+                        .token(request.getResetToken())
+                        .password(request.getPassword())
+                        .confirmPassword(request.getConfirmPassword())
+                        .build())
                 .map(v -> ApiResponseResetPassword.newBuilder()
                         .setStatus("success")
                         .setMessage("Password reset successfully")
@@ -69,7 +77,12 @@ public class AuthGrpcHandler extends pb.MutinyAuthServiceGrpc.AuthServiceImplBas
     @Override
     public Uni<ApiResponseRegister> registerUser(RegisterRequest request) {
         return authService
-                .register(request.getFirstname(), request.getLastname(), request.getEmail(), request.getPassword())
+                .register(com.sanedge.auth.domain.requests.RegisterRequest.builder()
+                        .firstName(request.getFirstname())
+                        .lastName(request.getLastname())
+                        .email(request.getEmail())
+                        .password(request.getPassword())
+                        .build())
                 .map(user -> ApiResponseRegister.newBuilder()
                         .setStatus("success")
                         .setMessage("User registered successfully. Verification email sent.")
@@ -83,7 +96,10 @@ public class AuthGrpcHandler extends pb.MutinyAuthServiceGrpc.AuthServiceImplBas
 
     @Override
     public Uni<ApiResponseLogin> loginUser(LoginRequest request) {
-        return authService.login(request.getEmail(), request.getPassword())
+        return authService.login(com.sanedge.auth.domain.requests.LoginRequest.builder()
+                        .email(request.getEmail())
+                        .password(request.getPassword())
+                        .build())
                 .map(tokens -> ApiResponseLogin.newBuilder()
                         .setStatus("success")
                         .setMessage("Logged in successfully")
@@ -100,7 +116,9 @@ public class AuthGrpcHandler extends pb.MutinyAuthServiceGrpc.AuthServiceImplBas
 
     @Override
     public Uni<ApiResponseRefreshToken> refreshToken(RefreshTokenRequest request) {
-        return authService.refresh(request.getRefreshToken())
+        return authService.refresh(com.sanedge.auth.domain.requests.RefreshTokenRequest.builder()
+                        .refreshToken(request.getRefreshToken())
+                        .build())
                 .map(tokens -> ApiResponseRefreshToken.newBuilder()
                         .setStatus("success")
                         .setMessage("Token refreshed successfully")
@@ -117,7 +135,9 @@ public class AuthGrpcHandler extends pb.MutinyAuthServiceGrpc.AuthServiceImplBas
 
     @Override
     public Uni<ApiResponseGetMe> getMe(GetMeRequest request) {
-        return authService.getMe((long) request.getUserId())
+        return authService.getMe(com.sanedge.auth.domain.requests.GetMeRequest.builder()
+                        .userId((long) request.getUserId())
+                        .build())
                 .map(user -> ApiResponseGetMe.newBuilder()
                         .setStatus("success")
                         .setMessage("Profile retrieved successfully")

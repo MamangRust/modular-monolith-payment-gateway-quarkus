@@ -14,21 +14,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sanedge.common.config.RedisService;
 import com.sanedge.saldo.domain.requests.MonthTotalSaldoBalance;
 import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.saldo.domain.response.stats.total_balance.SaldoMonthTotalBalanceResponse;
 import com.sanedge.saldo.domain.response.stats.total_balance.SaldoYearTotalBalanceResponse;
 import com.sanedge.saldo.repository.stats.SaldoTotalAmountRepository;
 import com.sanedge.saldo.service.stats.SaldoTotalAmountService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -40,31 +32,19 @@ public class SaldoTotalAmountServiceImpl implements SaldoTotalAmountService {
     private final SaldoTotalAmountRepository saldoTotalAmountRepository;
     private final RedisService redisService;
     private final ObjectMapper objectMapper;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
     @Inject
     public SaldoTotalAmountServiceImpl(SaldoTotalAmountRepository saldoTotalAmountRepository,
-                                       OpenTelemetry openTelemetry,
                                        RedisService redisService,
-                                       ObjectMapper objectMapper) {
+                                       ObjectMapper objectMapper,
+                                       TracingMetrics tracingMetrics) {
         this.saldoTotalAmountRepository = saldoTotalAmountRepository;
         this.redisService = redisService;
         this.objectMapper = objectMapper;
-        this.tracer = openTelemetry.getTracer("saldo-total-amount-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("saldo-total-amount-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     private String toJson(Object obj) {
@@ -119,70 +99,54 @@ public class SaldoTotalAmountServiceImpl implements SaldoTotalAmountService {
 
         String cacheKey = String.format("saldo-stats:total-balance:monthly:%d:%d", req.getYear(), req.getMonth());
 
-        return redisService.getReactive(cacheKey)
-                .chain(cachedJson -> {
-                    if (cachedJson != null) {
-                        logger.info("Cache HIT for key: {}", cacheKey);
-                        ApiResponse<List<SaldoMonthTotalBalanceResponse>> response = fromJson(cachedJson,
-                                new TypeReference<ApiResponse<List<SaldoMonthTotalBalanceResponse>>>() {
-                                });
-                        return Uni.createFrom().item(response);
-                    }
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-total-amount-service")
+                .put("operation", "find_month_total_balance")
+                .put("year", String.valueOf(req.getYear()))
+                .put("month", String.valueOf(req.getMonth()))
+                .build();
 
-                    logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findMonthTotalBalance")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "saldo-total-amount-service")
-                            .setAttribute("operation", "find_month_total_balance")
-                            .setAttribute("year", req.getYear().toString())
-                            .setAttribute("month", String.valueOf(req.getMonth()))
-                            .startSpan();
+        return tracingMetrics.<ApiResponse<List<SaldoMonthTotalBalanceResponse>>>traceAndMeasure(
+                "findMonthTotalBalance", "find_month_total_balance", attrs, () -> {
 
                     LocalDate currentMonth = LocalDate.of(req.getYear().intValue(), req.getMonth(), 1);
                     LocalDate nextMonth = currentMonth.plusMonths(1);
 
-                    return saldoTotalAmountRepository.findMonthlyTotalSaldoBalance(
-                            req.getYear(), req.getMonth(),
-                            (long) nextMonth.getYear(), nextMonth.getMonthValue())
-                            .chain(monthTotals -> {
-                                List<SaldoMonthTotalBalanceResponse> responseList = monthTotals.stream()
-                                        .map(SaldoMonthTotalBalanceResponse::from)
-                                        .collect(Collectors.toList());
+                    return redisService.getReactive(cacheKey)
+                            .chain(cachedJson -> {
+                                if (cachedJson != null) {
+                                    logger.info("Cache HIT for key: {}", cacheKey);
+                                    ApiResponse<List<SaldoMonthTotalBalanceResponse>> response = fromJson(cachedJson,
+                                            new TypeReference<ApiResponse<List<SaldoMonthTotalBalanceResponse>>>() {
+                                            });
+                                    return Uni.createFrom().item(response);
+                                }
 
-                                ApiResponse<List<SaldoMonthTotalBalanceResponse>> response = ApiResponse.success(
-                                        "Get monthly total balance success",
-                                        responseList
-                                );
+                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            logger.info("Cached monthly total balance for year: {}, month: {}", req.getYear(), req.getMonth());
-                                            span.setStatus(StatusCode.OK);
+                                return saldoTotalAmountRepository.findMonthlyTotalSaldoBalance(
+                                                req.getYear(), req.getMonth(),
+                                                (long) nextMonth.getYear(), nextMonth.getMonthValue())
+                                        .chain(monthTotals -> {
+                                            List<SaldoMonthTotalBalanceResponse> responseList = monthTotals.stream()
+                                                    .map(SaldoMonthTotalBalanceResponse::from)
+                                                    .collect(Collectors.toList());
 
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_month_total_balance",
-                                                    AttributeKey.stringKey("status"), "success"));
-                                            return response;
+                                            ApiResponse<List<SaldoMonthTotalBalanceResponse>> response = ApiResponse.success(
+                                                    "Get monthly total balance success",
+                                                    responseList
+                                            );
+
+                                            return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                                    .map(v -> {
+                                                        logger.info("Cached monthly total balance for year: {}, month: {}", req.getYear(), req.getMonth());
+                                                        return response;
+                                                    });
                                         });
                             })
                             .onFailure().recoverWithItem(e -> {
                                 logger.error("💥 Failed to fetch monthly total saldo balance for year={}, month={}", req.getYear(), req.getMonth(), e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_total_balance",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
                                 return new ApiResponse<>("error", "Failed to get monthly total balance", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_total_balance"));
                             });
                 });
     }
@@ -197,65 +161,48 @@ public class SaldoTotalAmountServiceImpl implements SaldoTotalAmountService {
 
         String cacheKey = "saldo-stats:total-balance:yearly:" + year;
 
-        return redisService.getReactive(cacheKey)
-                .chain(cachedJson -> {
-                    if (cachedJson != null) {
-                        logger.info("Cache HIT for key: {}", cacheKey);
-                        ApiResponse<List<SaldoYearTotalBalanceResponse>> response = fromJson(cachedJson,
-                                new TypeReference<ApiResponse<List<SaldoYearTotalBalanceResponse>>>() {
-                                });
-                        return Uni.createFrom().item(response);
-                    }
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-total-amount-service")
+                .put("operation", "find_year_total_balance")
+                .put("year", String.valueOf(year))
+                .build();
 
-                    logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findYearTotalBalance")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "saldo-total-amount-service")
-                            .setAttribute("operation", "find_year_total_balance")
-                            .setAttribute("year", year.toString())
-                            .startSpan();
+        return tracingMetrics.<ApiResponse<List<SaldoYearTotalBalanceResponse>>>traceAndMeasure(
+                "findYearTotalBalance", "find_year_total_balance", attrs, () ->
 
-                    return saldoTotalAmountRepository.findYearlyTotalSaldoBalance(year)
-                            .chain(yearTotals -> {
-                                List<SaldoYearTotalBalanceResponse> responseList = yearTotals.stream()
-                                        .map(SaldoYearTotalBalanceResponse::from)
-                                        .collect(Collectors.toList());
-
-                                ApiResponse<List<SaldoYearTotalBalanceResponse>> response = ApiResponse.success(
-                                        "Get yearly total balance success",
-                                        responseList
-                                );
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            logger.info("Cached yearly total balance for year: {}", year);
-                                            span.setStatus(StatusCode.OK);
-
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_year_total_balance",
-                                                    AttributeKey.stringKey("status"), "success"));
-                                            return response;
+                redisService.getReactive(cacheKey)
+                        .chain(cachedJson -> {
+                            if (cachedJson != null) {
+                                logger.info("Cache HIT for key: {}", cacheKey);
+                                ApiResponse<List<SaldoYearTotalBalanceResponse>> response = fromJson(cachedJson,
+                                        new TypeReference<ApiResponse<List<SaldoYearTotalBalanceResponse>>>() {
                                         });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch yearly total saldo balance for year={}", year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
+                                return Uni.createFrom().item(response);
+                            }
 
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_year_total_balance",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
+                            logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                return new ApiResponse<>("error", "Failed to get yearly total balance", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_year_total_balance"));
-                            });
-                });
+                            return saldoTotalAmountRepository.findYearlyTotalSaldoBalance(year)
+                                    .chain(yearTotals -> {
+                                        List<SaldoYearTotalBalanceResponse> responseList = yearTotals.stream()
+                                                .map(SaldoYearTotalBalanceResponse::from)
+                                                .collect(Collectors.toList());
+
+                                        ApiResponse<List<SaldoYearTotalBalanceResponse>> response = ApiResponse.success(
+                                                "Get yearly total balance success",
+                                                responseList
+                                        );
+
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                                .map(v -> {
+                                                    logger.info("Cached yearly total balance for year: {}", year);
+                                                    return response;
+                                                });
+                                    });
+                        })
+                        .onFailure().recoverWithItem(e -> {
+                            logger.error("💥 Failed to fetch yearly total saldo balance for year={}", year, e);
+                            return new ApiResponse<>("error", "Failed to get yearly total balance", Collections.emptyList());
+                        }));
     }
 }

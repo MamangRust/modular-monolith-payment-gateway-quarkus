@@ -10,6 +10,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sanedge.common.config.RedisService;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.withdraw.domain.requests.statsbycard.YearMonthCardNumber;
 import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.withdraw.domain.response.stats.amount.WithdrawMonthlyAmountResponse;
@@ -17,16 +18,7 @@ import com.sanedge.withdraw.domain.response.stats.amount.WithdrawYearlyAmountRes
 import com.sanedge.withdraw.repository.statsbycard.WithdrawAmountByCardRepository;
 import com.sanedge.withdraw.service.stats.amount.WithdrawAmountByCardService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -38,10 +30,7 @@ public class WithdrawAmountByCardImplService implements WithdrawAmountByCardServ
     private final WithdrawAmountByCardRepository withdrawAmountByCardRepository;
     private final RedisService redisService;
     private final ObjectMapper objectMapper;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
@@ -49,20 +38,11 @@ public class WithdrawAmountByCardImplService implements WithdrawAmountByCardServ
     public WithdrawAmountByCardImplService(WithdrawAmountByCardRepository withdrawAmountByCardRepository,
             RedisService redisService,
             ObjectMapper objectMapper,
-            OpenTelemetry openTelemetry) {
+            TracingMetrics tracingMetrics) {
         this.withdrawAmountByCardRepository = withdrawAmountByCardRepository;
         this.redisService = redisService;
         this.objectMapper = objectMapper;
-        this.tracer = openTelemetry.getTracer("withdraw-amount-by-card-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("withdraw-amount-by-card-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     private String toJson(Object obj) {
@@ -112,6 +92,12 @@ public class WithdrawAmountByCardImplService implements WithdrawAmountByCardServ
 
         String cacheKey = String.format("withdraws:statsbycard:monthly:amount:%s:%d", cardNumber, year);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_monthly_by_card")
+                .put("cardNumber", cardNumber)
+                .put("year", year)
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -124,53 +110,24 @@ public class WithdrawAmountByCardImplService implements WithdrawAmountByCardServ
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findMonthlyWithdrawsByCard")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "withdraw-amount-by-card-service")
-                            .setAttribute("operation", "find_monthly_by_card")
-                            .setAttribute("cardNumber", cardNumber)
-                            .setAttribute("year", String.valueOf(year))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findMonthlyWithdrawsByCard", "find_monthly_by_card", attrs,
+                            () -> withdrawAmountByCardRepository.findMonthlyWithdrawsByCard(cardNumber, year)
+                                    .chain(amounts -> {
+                                        List<WithdrawMonthlyAmountResponse> response = amounts.stream()
+                                                .map(WithdrawMonthlyAmountResponse::from)
+                                                .collect(Collectors.toList());
 
-                    return withdrawAmountByCardRepository.findMonthlyWithdrawsByCard(cardNumber, year)
-                            .chain(amounts -> {
-                                List<WithdrawMonthlyAmountResponse> response = amounts.stream()
-                                        .map(WithdrawMonthlyAmountResponse::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService
-                                        .setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_monthly_by_card",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success(
-                                                    "Monthly withdraw amounts by card retrieved successfully!",
-                                                    response);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("❌ Failed to fetch monthly withdraw amounts by card", e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_monthly_by_card",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch monthly withdraw amounts by card",
-                                        null);
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_monthly_by_card"));
-                            });
+                                        return redisService
+                                                .setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success(
+                                                        "Monthly withdraw amounts by card retrieved successfully!",
+                                                        response));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("❌ Failed to fetch monthly withdraw amounts by card", e);
+                                        return new ApiResponse<>("error", "Failed to fetch monthly withdraw amounts by card",
+                                                null);
+                                    }));
                 });
     }
 
@@ -191,6 +148,12 @@ public class WithdrawAmountByCardImplService implements WithdrawAmountByCardServ
 
         String cacheKey = String.format("withdraws:statsbycard:yearly:amount:%s:%d", cardNumber, year);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_yearly_by_card")
+                .put("cardNumber", cardNumber)
+                .put("year", year)
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -203,53 +166,24 @@ public class WithdrawAmountByCardImplService implements WithdrawAmountByCardServ
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findYearlyWithdrawsByCard")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "withdraw-amount-by-card-service")
-                            .setAttribute("operation", "find_yearly_by_card")
-                            .setAttribute("cardNumber", cardNumber)
-                            .setAttribute("year", String.valueOf(year))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findYearlyWithdrawsByCard", "find_yearly_by_card", attrs,
+                            () -> withdrawAmountByCardRepository.findYearlyWithdrawsByCard(cardNumber, year)
+                                    .chain(amounts -> {
+                                        List<WithdrawYearlyAmountResponse> response = amounts.stream()
+                                                .map(WithdrawYearlyAmountResponse::from)
+                                                .collect(Collectors.toList());
 
-                    return withdrawAmountByCardRepository.findYearlyWithdrawsByCard(cardNumber, year)
-                            .chain(amounts -> {
-                                List<WithdrawYearlyAmountResponse> response = amounts.stream()
-                                        .map(WithdrawYearlyAmountResponse::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService
-                                        .setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_yearly_by_card",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success(
-                                                    "Yearly withdraw amounts by card retrieved successfully!",
-                                                    response);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("❌ Failed to fetch yearly withdraw amounts by card", e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_by_card",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch yearly withdraw amounts by card",
-                                        null);
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_by_card"));
-                            });
+                                        return redisService
+                                                .setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success(
+                                                        "Yearly withdraw amounts by card retrieved successfully!",
+                                                        response));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("❌ Failed to fetch yearly withdraw amounts by card", e);
+                                        return new ApiResponse<>("error", "Failed to fetch yearly withdraw amounts by card",
+                                                null);
+                                    }));
                 });
     }
 }

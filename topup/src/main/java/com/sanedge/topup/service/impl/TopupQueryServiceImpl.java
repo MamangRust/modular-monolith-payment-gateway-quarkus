@@ -24,6 +24,7 @@ import com.sanedge.common.exception.ResourceNotFoundException;
 import com.sanedge.topup.repository.TopupQueryRepository;
 import com.sanedge.topup.service.TopupQueryService;
 
+import com.sanedge.common.observability.TracingMetrics;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
@@ -70,6 +71,13 @@ public class TopupQueryServiceImpl implements TopupQueryService {
                 .setDescription("Request duration in seconds")
                 .setUnit("s")
                 .build();
+    }
+
+    public TopupQueryServiceImpl(TopupQueryRepository topupQueryRepository,
+            RedisService redisService,
+            ObjectMapper objectMapper,
+            TracingMetrics tracingMetrics) {
+        this(topupQueryRepository, OpenTelemetry.noop(), redisService, objectMapper);
     }
 
     private String toJson(Object obj) {
@@ -125,7 +133,7 @@ public class TopupQueryServiceImpl implements TopupQueryService {
                             .setAttribute("operation", "find_all_topups")
                             .startSpan();
 
-                    return topupQueryRepository.findTopups(search, page, pageSize)
+                    return topupQueryRepository.findTopups(req)
                             .chain(pagedResult -> {
                                 span.setAttribute("topup.count", pagedResult.getTotalRecords());
                                 span.setAttribute("topup.page", req.getPage());
@@ -197,7 +205,7 @@ public class TopupQueryServiceImpl implements TopupQueryService {
                             .setAttribute("cardNumber", cardNumber)
                             .startSpan();
 
-                    return topupQueryRepository.findTopupByCard(cardNumber, search, page, pageSize)
+                    return topupQueryRepository.findTopupByCard(req)
                             .chain(pagedResult -> {
                                 span.setAttribute("topup.count", pagedResult.getTotalRecords());
                                 span.setAttribute("topup.page", req.getPage());
@@ -269,7 +277,7 @@ public class TopupQueryServiceImpl implements TopupQueryService {
                             .setAttribute("operation", "find_active_topups")
                             .startSpan();
 
-                    return topupQueryRepository.findActiveTopups(search, page, pageSize)
+                    return topupQueryRepository.findActiveTopups(req)
                             .chain(pagedResult -> {
                                 span.setAttribute("topup.count", pagedResult.getTotalRecords());
                                 span.setAttribute("topup.page", req.getPage());
@@ -340,7 +348,7 @@ public class TopupQueryServiceImpl implements TopupQueryService {
                             .setAttribute("operation", "find_trashed_topups")
                             .startSpan();
 
-                    return topupQueryRepository.findTrashedTopups(search, page, pageSize)
+                    return topupQueryRepository.findTrashedTopups(req)
                             .chain(pagedResult -> {
                                 span.setAttribute("topup.count", pagedResult.getTotalRecords());
                                 span.setAttribute("topup.page", req.getPage());

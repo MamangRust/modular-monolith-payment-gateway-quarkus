@@ -15,10 +15,31 @@ public class TransactionMonthAmountResponse {
     private String monthName;
     private Long totalAmount;
 
+    public TransactionMonthAmountResponse(String monthName, long totalAmount) {
+        this.monthName = monthName;
+        this.totalAmount = totalAmount;
+    }
+
+    public String getMonthName() {
+        return monthName;
+    }
+
+    public void setMonthName(String monthName) {
+        this.monthName = monthName;
+    }
+
+    public Long getTotalAmount() {
+        return totalAmount;
+    }
+
+    public void setTotalAmount(Long totalAmount) {
+        this.totalAmount = totalAmount;
+    }
+
     public static TransactionMonthAmountResponse from(TransactionMonthAmount dto) {
-        return TransactionMonthAmountResponse.builder()
-                .monthName(dto.getMonth())
-                .totalAmount(dto.getTotalAmount().longValue())
-                .build();
+        return new TransactionMonthAmountResponse(
+            dto.getMonth(),
+            dto.getTotalAmount()
+        );
     }
 }

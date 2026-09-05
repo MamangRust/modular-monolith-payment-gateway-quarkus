@@ -86,4 +86,74 @@ public class TopupCommandRepository implements PanacheRepository<Topup> {
         return delete("deletedAt IS NOT NULL")
                 .map(count -> count > 0);
     }
+
+    @WithTransaction
+    public Uni<Boolean> claimCompensation(Long topupId, String workerId, String claimToken,
+            java.sql.Timestamp now, java.sql.Timestamp leaseUntil, int maxAttempts) {
+        return find("topupId = ?1 AND (compensationWorkerId IS NULL OR compensationLeaseUntil < ?2)",
+                topupId, now).firstResult()
+                .chain(topup -> {
+                    if (topup != null) {
+                        int attempts = topup.compensationAttempts != null ? topup.compensationAttempts : 0;
+                        if (attempts >= maxAttempts) {
+                            return Uni.createFrom().item(false);
+                        }
+                        topup.compensationWorkerId = workerId;
+                        topup.compensationClaimToken = claimToken;
+                        topup.compensationLeaseUntil = leaseUntil;
+                        topup.compensationAttempts = attempts + 1;
+                        topup.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(topup).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> completeCompensation(Long topupId, String workerId, String claimToken) {
+        return find("topupId = ?1 AND compensationClaimToken = ?2", topupId, claimToken).firstResult()
+                .chain(topup -> {
+                    if (topup != null && workerId.equals(topup.compensationWorkerId)) {
+                        topup.compensationWorkerId = null;
+                        topup.compensationClaimToken = null;
+                        topup.compensationLeaseUntil = null;
+                        topup.status = com.sanedge.common.enums.Status.SUCCESS;
+                        topup.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(topup).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> releaseCompensation(Long topupId, String workerId, String claimToken,
+            java.sql.Timestamp leaseUntil, String reason) {
+        return find("topupId = ?1 AND compensationClaimToken = ?2", topupId, claimToken).firstResult()
+                .chain(topup -> {
+                    if (topup != null && workerId.equals(topup.compensationWorkerId)) {
+                        topup.compensationWorkerId = null;
+                        topup.compensationClaimToken = null;
+                        topup.compensationLeaseUntil = leaseUntil;
+                        topup.compensationReason = reason;
+                        topup.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(topup).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> exhaustCompensation(Long topupId, int maxAttempts, String reason) {
+        return find("topupId = ?1", topupId).firstResult()
+                .chain(topup -> {
+                    if (topup != null) {
+                        topup.compensationAttempts = maxAttempts;
+                        topup.compensationReason = reason;
+                        topup.status = com.sanedge.common.enums.Status.FAILED;
+                        topup.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(topup).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
 }

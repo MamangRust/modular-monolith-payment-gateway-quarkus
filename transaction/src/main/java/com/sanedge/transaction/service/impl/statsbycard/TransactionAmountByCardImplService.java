@@ -17,17 +17,9 @@ import com.sanedge.transaction.domain.response.stats.amount.TransactionMonthAmou
 import com.sanedge.transaction.domain.response.stats.amount.TransactionYearlyAmountResponse;
 import com.sanedge.transaction.repository.statsbycard.TransactionAmountByCardRepository;
 import com.sanedge.transaction.service.stats.amount.TransactionAmountByCardService;
+import com.sanedge.common.observability.TracingMetrics;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -39,10 +31,7 @@ public class TransactionAmountByCardImplService implements TransactionAmountByCa
     private final TransactionAmountByCardRepository transactionAmountByCardRepository;
     private final RedisService redisService;
     private final ObjectMapper objectMapper;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
@@ -50,20 +39,11 @@ public class TransactionAmountByCardImplService implements TransactionAmountByCa
     public TransactionAmountByCardImplService(TransactionAmountByCardRepository transactionAmountByCardRepository,
                                               RedisService redisService,
                                               ObjectMapper objectMapper,
-                                              OpenTelemetry openTelemetry) {
+                                              TracingMetrics tracingMetrics) {
         this.transactionAmountByCardRepository = transactionAmountByCardRepository;
         this.redisService = redisService;
         this.objectMapper = objectMapper;
-        this.tracer = openTelemetry.getTracer("transaction-amount-by-card-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("transaction-amount-by-card-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     private String toJson(Object obj) {
@@ -106,61 +86,40 @@ public class TransactionAmountByCardImplService implements TransactionAmountByCa
 
         String cacheKey = String.format("transactions:stats:amount:card:month:%s:%d", cardNumber, year);
 
-        return redisService.getReactive(cacheKey)
-                .chain(cachedJson -> {
-                    if (cachedJson != null) {
-                        logger.info("Cache HIT for key: {}", cacheKey);
-                        List<TransactionMonthAmountResponse> cached = fromJson(cachedJson,
-                                new TypeReference<List<TransactionMonthAmountResponse>>() {
+        Attributes attrs = Attributes.builder()
+                .put("cardNumber", cardNumber)
+                .put("year", String.valueOf(year))
+                .build();
+
+        return tracingMetrics.traceAndMeasure("findMonthlyAmountsByCard", "find_monthly_amounts", attrs, () -> {
+            return redisService.getReactive(cacheKey)
+                    .chain(cachedJson -> {
+                        if (cachedJson != null) {
+                            logger.info("Cache HIT for key: {}", cacheKey);
+                            List<TransactionMonthAmountResponse> cached = fromJson(cachedJson,
+                                    new TypeReference<List<TransactionMonthAmountResponse>>() {});
+                            return Uni.createFrom().item(ApiResponse.success("Monthly transaction amounts for cardNumber retrieved successfully", cached));
+                        }
+
+                        logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
+
+                        return transactionAmountByCardRepository.findMonthlyAmountsByCard(cardNumber, year)
+                                .chain(amounts -> {
+                                    List<TransactionMonthAmountResponse> response = amounts.stream()
+                                            .map(TransactionMonthAmountResponse::from)
+                                            .collect(Collectors.toList());
+
+                                    return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                            .map(v -> {
+                                                logger.info("Cached response for key: {}", cacheKey);
+                                                return ApiResponse.success("Monthly transaction amounts for cardNumber", response);
+                                            });
                                 });
-                        return Uni.createFrom().item(ApiResponse.success("Monthly transaction amounts for cardNumber retrieved successfully", cached));
-                    }
-
-                    logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findMonthlyAmountsByCard")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transaction-amount-by-card-service")
-                            .setAttribute("operation", "find_monthly_amounts")
-                            .setAttribute("cardNumber", cardNumber)
-                            .setAttribute("year", String.valueOf(year))
-                            .startSpan();
-
-                    return transactionAmountByCardRepository.findMonthlyAmountsByCard(cardNumber, year)
-                            .chain(amounts -> {
-                                List<TransactionMonthAmountResponse> response = amounts.stream()
-                                        .map(TransactionMonthAmountResponse::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_monthly_amounts",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Monthly transaction amounts for cardNumber", response);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch monthly transaction amounts for cardNumber={}, year={}", cardNumber, year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_monthly_amounts",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch monthly transaction amounts", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_monthly_amounts"));
-                            });
-                });
+                    });
+        }).onFailure().recoverWithItem(e -> {
+            logger.error("💥 Failed to fetch monthly transaction amounts for cardNumber={}, year={}", cardNumber, year, e);
+            return new ApiResponse<>("error", "Failed to fetch monthly transaction amounts", Collections.emptyList());
+        });
     }
 
     @Override
@@ -177,60 +136,39 @@ public class TransactionAmountByCardImplService implements TransactionAmountByCa
 
         String cacheKey = String.format("transactions:stats:amount:card:year:%s:%d", cardNumber, year);
 
-        return redisService.getReactive(cacheKey)
-                .chain(cachedJson -> {
-                    if (cachedJson != null) {
-                        logger.info("Cache HIT for key: {}", cacheKey);
-                        List<TransactionYearlyAmountResponse> cached = fromJson(cachedJson,
-                                new TypeReference<List<TransactionYearlyAmountResponse>>() {
+        Attributes attrs = Attributes.builder()
+                .put("cardNumber", cardNumber)
+                .put("year", String.valueOf(year))
+                .build();
+
+        return tracingMetrics.traceAndMeasure("findYearlyAmountsByCard", "find_yearly_amounts", attrs, () -> {
+            return redisService.getReactive(cacheKey)
+                    .chain(cachedJson -> {
+                        if (cachedJson != null) {
+                            logger.info("Cache HIT for key: {}", cacheKey);
+                            List<TransactionYearlyAmountResponse> cached = fromJson(cachedJson,
+                                    new TypeReference<List<TransactionYearlyAmountResponse>>() {});
+                            return Uni.createFrom().item(ApiResponse.success("Yearly transaction amounts for cardNumber retrieved successfully", cached));
+                        }
+
+                        logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
+
+                        return transactionAmountByCardRepository.findYearlyAmountsByCard(cardNumber, year)
+                                .chain(amounts -> {
+                                    List<TransactionYearlyAmountResponse> response = amounts.stream()
+                                            .map(TransactionYearlyAmountResponse::from)
+                                            .collect(Collectors.toList());
+
+                                    return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                            .map(v -> {
+                                                logger.info("Cached response for key: {}", cacheKey);
+                                                return ApiResponse.success("Yearly transaction amounts for cardNumber", response);
+                                            });
                                 });
-                        return Uni.createFrom().item(ApiResponse.success("Yearly transaction amounts for cardNumber retrieved successfully", cached));
-                    }
-
-                    logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findYearlyAmountsByCard")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transaction-amount-by-card-service")
-                            .setAttribute("operation", "find_yearly_amounts")
-                            .setAttribute("cardNumber", cardNumber)
-                            .setAttribute("year", String.valueOf(year))
-                            .startSpan();
-
-                    return transactionAmountByCardRepository.findYearlyAmountsByCard(cardNumber, year)
-                            .chain(amounts -> {
-                                List<TransactionYearlyAmountResponse> response = amounts.stream()
-                                        .map(TransactionYearlyAmountResponse::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_yearly_amounts",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Yearly transaction amounts for cardNumber", response);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch yearly transaction amounts for cardNumber={}, year={}", cardNumber, year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_amounts",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch yearly transaction amounts", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_amounts"));
-                            });
-                });
+                    });
+        }).onFailure().recoverWithItem(e -> {
+            logger.error("💥 Failed to fetch yearly transaction amounts for cardNumber={}, year={}", cardNumber, year, e);
+            return new ApiResponse<>("error", "Failed to fetch yearly transaction amounts", Collections.emptyList());
+        });
     }
 }

@@ -14,6 +14,7 @@ import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.common.exception.InvalidRequestException;
 import com.sanedge.common.exception.ResourceAlreadyExistsException;
 import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.common.utils.PasswordUtil;
 import com.sanedge.user.domain.requests.RegisterRequest;
 import com.sanedge.user.domain.requests.UpdateUserRequest;
@@ -24,16 +25,7 @@ import com.sanedge.user.entity.User;
 import com.sanedge.user.repository.UserRepository;
 import com.sanedge.user.service.UserCommandService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.quarkus.grpc.GrpcClient;
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
 import io.smallrye.mutiny.Uni;
@@ -47,789 +39,457 @@ public class UserCommandServiceImpl implements UserCommandService {
 
         UserRepository userRepository;
         PasswordUtil passwordUtil;
-        OpenTelemetry openTelemetry;
         RedisService redisService;
+        TracingMetrics tracingMetrics;
 
         @Inject
         @GrpcClient("role")
         pb.role.RoleService roleQueryService;
 
-        private final Tracer tracer;
-        private final LongCounter requestsTotal;
-        private final DoubleHistogram requestDurationSeconds;
-
         @Inject
         public UserCommandServiceImpl(UserRepository userRepository,
                         PasswordUtil passwordUtil,
-                        OpenTelemetry openTelemetry, RedisService redisService) {
+                        RedisService redisService, TracingMetrics tracingMetrics) {
                 this.userRepository = userRepository;
                 this.passwordUtil = passwordUtil;
-                this.openTelemetry = openTelemetry;
                 this.redisService = redisService;
-                this.tracer = openTelemetry.getTracer("user-command-service", "1.0.0");
-                Meter meter = openTelemetry.getMeter("user-command-service");
-
-                this.requestsTotal = meter.counterBuilder("requests_total")
-                                .setDescription("Total number of requests")
-                                .build();
-                this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                                .setDescription("Request duration in seconds")
-                                .setUnit("s")
-                                .build();
+                this.tracingMetrics = tracingMetrics;
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<UserResponse>> createUser(RegisterRequest request) {
-                long startTime = System.currentTimeMillis();
-                Span span = tracer.spanBuilder("createUser")
-                                .setSpanKind(SpanKind.SERVER)
-                                .setAttribute("service.name", "user-service")
-                                .setAttribute("operation", "create_user")
-                                .setAttribute("user.username", request.getUsername())
-                                .setAttribute("user.email", request.getEmail())
-                                .startSpan();
-
                 logger.info("Creating new user with username: {}", request.getUsername());
 
                 if (!request.getPassword().equals(request.getConfirmPassword())) {
                         logger.warn("User creation failed - passwords do not match for username: {}",
                                         request.getUsername());
-                        span.setStatus(StatusCode.ERROR, "Passwords do not match");
-                        span.setAttribute("user.create.success", false);
-
-                        requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "create_user",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), "invalid_request"));
-
                         throw new InvalidRequestException("Passwords do not match");
                 }
 
-                return userRepository.existsByUsername(request.getUsername())
-                                .chain(usernameExists -> {
-                                        if (usernameExists) {
-                                                logger.warn("User creation failed - username already exists: {}",
-                                                                request.getUsername());
-                                                span.setStatus(StatusCode.ERROR, "Username already exists");
-                                                span.setAttribute("user.create.success", false);
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "create_user")
+                                .put("service.name", "user-service")
+                                .put("user.username", request.getUsername())
+                                .build();
 
-                                                requestsTotal.add(1, Attributes.of(
-                                                                AttributeKey.stringKey("operation"), "create_user",
-                                                                AttributeKey.stringKey("status"), "failed",
-                                                                AttributeKey.stringKey("error_type"),
-                                                                "already_exists"));
+                return tracingMetrics.<ApiResponse<UserResponse>>traceAndMeasure(
+                                "createUser", "create_user", attrs, () -> {
 
-                                                throw new ResourceAlreadyExistsException("Username already exists");
-                                        }
-                                        return userRepository.existsByEmail(request.getEmail());
-                                })
-                                .chain(emailExists -> {
-                                        if (emailExists) {
-                                                logger.warn("User creation failed - email already exists: {}",
-                                                                request.getEmail());
-                                                span.setStatus(StatusCode.ERROR, "Email already exists");
-                                                span.setAttribute("user.create.success", false);
+                                        return userRepository.existsByUsername(request.getUsername())
+                                                        .chain(usernameExists -> {
+                                                                if (usernameExists) {
+                                                                        logger.warn("User creation failed - username already exists: {}",
+                                                                                        request.getUsername());
+                                                                        throw new ResourceAlreadyExistsException(
+                                                                                        "Username already exists");
+                                                                }
+                                                                return userRepository.existsByEmail(request.getEmail());
+                                                        })
+                                                        .chain(emailExists -> {
+                                                                if (emailExists) {
+                                                                        logger.warn("User creation failed - email already exists: {}",
+                                                                                        request.getEmail());
+                                                                        throw new ResourceAlreadyExistsException(
+                                                                                        "Email already exists");
+                                                                }
 
-                                                requestsTotal.add(1, Attributes.of(
-                                                                AttributeKey.stringKey("operation"), "create_user",
-                                                                AttributeKey.stringKey("status"), "failed",
-                                                                AttributeKey.stringKey("error_type"),
-                                                                "already_exists"));
+                                                                User user = new User();
+                                                                user.setUsername(request.getUsername());
+                                                                user.setEmail(request.getEmail());
+                                                                user.setFirstname(request.getFirstname());
+                                                                user.setLastname(request.getLastname());
+                                                                user.setPassword(passwordUtil.hashPassword(request.getPassword()));
 
-                                                throw new ResourceAlreadyExistsException("Email already exists");
-                                        }
+                                                                Uni<Set<Role>> rolesUni;
+                                                                if (request.getRoleNames() != null && !request.getRoleNames().isEmpty()) {
+                                                                        List<Uni<Role>> roleUnis = request.getRoleNames().stream()
+                                                                                        .map(this::resolveRoleViaGrpc)
+                                                                                        .collect(Collectors.toList());
+                                                                        rolesUni = Uni.join().all(roleUnis).andFailFast()
+                                                                                        .map(roles -> roles.stream()
+                                                                                                        .filter(java.util.Objects::nonNull)
+                                                                                                        .collect(Collectors.toSet()));
+                                                                } else {
+                                                                        rolesUni = Uni.createFrom().item(Set.of());
+                                                                }
 
-                                        User user = new User();
-                                        user.setUsername(request.getUsername());
-                                        user.setEmail(request.getEmail());
-                                        user.setFirstname(request.getFirstname());
-                                        user.setLastname(request.getLastname());
-                                        user.setPassword(passwordUtil.hashPassword(request.getPassword()));
+                                                                return rolesUni.chain(rolesToAssign -> {
+                                                                        if (rolesToAssign.isEmpty()) {
+                                                                                return resolveRoleViaGrpc("ROLE_ADMIN")
+                                                                                                .map(adminRole -> {
+                                                                                                        Set<Role> roles = new java.util.HashSet<>();
+                                                                                                        if (adminRole != null) {
+                                                                                                                roles.add(adminRole);
+                                                                                                        }
+                                                                                                        return roles;
+                                                                                                });
+                                                                        }
+                                                                        return Uni.createFrom().item(rolesToAssign);
+                                                                }).chain(rolesToAssign -> {
+                                                                        user.setRoles(rolesToAssign);
+                                                                        return userRepository.persist(user)
+                                                                                        .map(v -> {
+                                                                                                UserResponse userResponse = UserResponse
+                                                                                                                .from(user);
 
-                                        Uni<Set<Role>> rolesUni;
-                                        if (request.getRoleNames() != null && !request.getRoleNames().isEmpty()) {
-                                                List<Uni<Role>> roleUnis = request.getRoleNames().stream()
-                                                                .map(this::resolveRoleViaGrpc)
-                                                                .collect(Collectors.toList());
-                                                rolesUni = Uni.join().all(roleUnis).andFailFast()
-                                                                .map(roles -> roles.stream()
-                                                                                .filter(java.util.Objects::nonNull)
-                                                                                .collect(Collectors.toSet()));
-                                        } else {
-                                                rolesUni = Uni.createFrom().item(Set.of());
-                                        }
+                                                                                                logger.info("Successfully created user with id: {} and username: {}",
+                                                                                                                user.id,
+                                                                                                                user.getUsername());
+                                                                                                logger.info("User created. List caches will be refreshed upon expiry.");
 
-                                        return rolesUni.chain(rolesToAssign -> {
-                                                if (rolesToAssign.isEmpty()) {
-                                                        return resolveRoleViaGrpc("ROLE_ADMIN")
-                                                                        .map(adminRole -> {
-                                                                                Set<Role> roles = new java.util.HashSet<>();
-                                                                                if (adminRole != null) {
-                                                                                        roles.add(adminRole);
-                                                                                }
-                                                                                return roles;
-                                                                        });
-                                                }
-                                                return Uni.createFrom().item(rolesToAssign);
-                                        }).chain(rolesToAssign -> {
-                                                user.setRoles(rolesToAssign);
-                                                return userRepository.persist(user)
-                                                                .map(v -> {
-                                                                        span.setAttribute("user.id", user.id);
-                                                                        span.setAttribute("user.create.success", true);
-
-                                                                        UserResponse userResponse = UserResponse
-                                                                                        .from(user);
-
-                                                                        logger.info("Successfully created user with id: {} and username: {}",
-                                                                                        user.id,
-                                                                                        user.getUsername());
-                                                                        span.setStatus(StatusCode.OK);
-
-                                                                        requestsTotal.add(1, Attributes.of(
-                                                                                        AttributeKey.stringKey(
-                                                                                                        "operation"),
-                                                                                        "create_user",
-                                                                                        AttributeKey.stringKey(
-                                                                                                        "status"),
-                                                                                        "success"));
-
-                                                                        logger.info("User created. List caches will be refreshed upon expiry.");
-
-                                                                        return ApiResponse.success(
-                                                                                        "User registered successfully",
-                                                                                        userResponse);
+                                                                                                return ApiResponse.success(
+                                                                                                                "User registered successfully",
+                                                                                                                userResponse);
+                                                                                        });
                                                                 });
-                                        });
-                                })
-                                .onFailure().invoke(e -> {
+                                                        });
+                                }).onFailure().invoke(e -> {
                                         logger.error("Error creating user with username: {}", request.getUsername(), e);
-                                        span.recordException(e);
-                                        span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "create_user",
-                                                        AttributeKey.stringKey("status"), "failed",
-                                                        AttributeKey.stringKey("error_type"),
-                                                        e.getClass().getSimpleName()));
-                                })
-                                .eventually(() -> {
-                                        span.end();
-                                        double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                        requestDurationSeconds.record(duration, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "create_user"));
-                                        logger.debug("Create user operation completed in {} seconds", duration);
                                 });
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<UserResponse>> updateUser(@Valid UpdateUserRequest request) {
-                long startTime = System.currentTimeMillis();
-                Span span = tracer.spanBuilder("updateUser")
-                                .setSpanKind(SpanKind.SERVER)
-                                .setAttribute("service.name", "user-service")
-                                .setAttribute("operation", "update_user")
-                                .setAttribute("user.id", request.getId().toString())
-                                .startSpan();
-
                 logger.info("Updating user with id: {}", request.getId());
 
-                return userRepository.findById(request.getId())
-                                .chain(existingUser -> {
-                                        if (existingUser == null) {
-                                                logger.warn("User update failed - user not found with id: {}",
-                                                                request.getId());
-                                                span.setStatus(StatusCode.ERROR, "User not found");
-                                                span.setAttribute("user.update.success", false);
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "update_user")
+                                .put("service.name", "user-service")
+                                .put("user.id", String.valueOf(request.getId()))
+                                .build();
 
-                                                requestsTotal.add(1, Attributes.of(
-                                                                AttributeKey.stringKey("operation"), "update_user",
-                                                                AttributeKey.stringKey("status"), "failed",
-                                                                AttributeKey.stringKey("error_type"), "not_found"));
+                return tracingMetrics.<ApiResponse<UserResponse>>traceAndMeasure(
+                                "updateUser", "update_user", attrs, () -> {
 
-                                                throw new ResourceNotFoundException(
-                                                                "User not found with id: " + request.getId());
-                                        }
+                                        return userRepository.findById(request.getId())
+                                                        .chain(existingUser -> {
+                                                                if (existingUser == null) {
+                                                                        logger.warn("User update failed - user not found with id: {}",
+                                                                                        request.getId());
+                                                                        throw new ResourceNotFoundException(
+                                                                                        "User not found with id: " + request.getId());
+                                                                }
 
-                                        Uni<Void> checkUsernameFlow;
-                                        if (request.getUsername() != null
-                                                        && !request.getUsername().equals(existingUser.getUsername())) {
-                                                checkUsernameFlow = userRepository
-                                                                .existsByUsername(request.getUsername())
-                                                                .map(exists -> {
-                                                                        if (exists) {
-                                                                                logger.warn("User update failed - username '{}' already in use",
-                                                                                                request.getUsername());
-                                                                                span.setStatus(StatusCode.ERROR,
-                                                                                                "Username already in use");
-                                                                                span.setAttribute("user.update.success",
-                                                                                                false);
+                                                                Uni<Void> checkUsernameFlow;
+                                                                if (request.getUsername() != null
+                                                                                && !request.getUsername().equals(existingUser.getUsername())) {
+                                                                        checkUsernameFlow = userRepository
+                                                                                        .existsByUsername(request.getUsername())
+                                                                                        .map(exists -> {
+                                                                                                if (exists) {
+                                                                                                        logger.warn("User update failed - username '{}' already in use",
+                                                                                                                        request.getUsername());
+                                                                                                        throw new ResourceAlreadyExistsException(
+                                                                                                                        "Username '" + request
+                                                                                                                                        .getUsername()
+                                                                                                                                        + "' is already in use");
+                                                                                                }
+                                                                                                existingUser.setUsername(request.getUsername());
+                                                                                                return null;
+                                                                                        });
+                                                                } else {
+                                                                        checkUsernameFlow = Uni.createFrom().nullItem();
+                                                                }
 
-                                                                                requestsTotal.add(1, Attributes.of(
-                                                                                                AttributeKey.stringKey(
-                                                                                                                "operation"),
-                                                                                                "update_user",
-                                                                                                AttributeKey.stringKey(
-                                                                                                                "status"),
-                                                                                                "failed",
-                                                                                                AttributeKey.stringKey(
-                                                                                                                "error_type"),
-                                                                                                "already_exists"));
-
-                                                                                throw new ResourceAlreadyExistsException(
-                                                                                                "Username '" + request
-                                                                                                                .getUsername()
-                                                                                                                + "' is already in use");
+                                                                return checkUsernameFlow.chain(v -> {
+                                                                        Uni<Void> checkEmailFlow;
+                                                                        if (request.getEmail() != null && !request.getEmail()
+                                                                                        .equals(existingUser.getEmail())) {
+                                                                                checkEmailFlow = userRepository
+                                                                                                .existsByEmail(request.getEmail())
+                                                                                                .map(exists -> {
+                                                                                                        if (exists) {
+                                                                                                                logger.warn("User update failed - email '{}' already in use",
+                                                                                                                                request.getEmail());
+                                                                                                                throw new ResourceAlreadyExistsException(
+                                                                                                                                "Email '" + request
+                                                                                                                                                .getEmail()
+                                                                                                                                                + "' is already in use");
+                                                                                                        }
+                                                                                                        existingUser.setEmail(request.getEmail());
+                                                                                                        return null;
+                                                                                                });
+                                                                        } else {
+                                                                                checkEmailFlow = Uni.createFrom().nullItem();
                                                                         }
-                                                                        existingUser.setUsername(request.getUsername());
-                                                                        return null;
-                                                                });
-                                        } else {
-                                                checkUsernameFlow = Uni.createFrom().nullItem();
-                                        }
 
-                                        return checkUsernameFlow.chain(v -> {
-                                                Uni<Void> checkEmailFlow;
-                                                if (request.getEmail() != null && !request.getEmail()
-                                                                .equals(existingUser.getEmail())) {
-                                                        checkEmailFlow = userRepository
-                                                                        .existsByEmail(request.getEmail())
-                                                                        .map(exists -> {
-                                                                                if (exists) {
-                                                                                        logger.warn("User update failed - email '{}' already in use",
-                                                                                                        request.getEmail());
-                                                                                        span.setStatus(StatusCode.ERROR,
-                                                                                                        "Email already in use");
-                                                                                        span.setAttribute(
-                                                                                                        "user.update.success",
-                                                                                                        false);
-
-                                                                                        requestsTotal.add(1,
-                                                                                                        Attributes.of(
-                                                                                                                        AttributeKey.stringKey(
-                                                                                                                                        "operation"),
-                                                                                                                        "update_user",
-                                                                                                                        AttributeKey.stringKey(
-                                                                                                                                        "status"),
-                                                                                                                        "failed",
-                                                                                                                        AttributeKey.stringKey(
-                                                                                                                                        "error_type"),
-                                                                                                                        "already_exists"));
-
-                                                                                        throw new ResourceAlreadyExistsException(
-                                                                                                        "Email '" + request
-                                                                                                                        .getEmail()
-                                                                                                                        + "' is already in use");
+                                                                        return checkEmailFlow;
+                                                                }).chain(v -> {
+                                                                        if (request.getPassword() != null) {
+                                                                                if (!request.getPassword()
+                                                                                                .equals(request.getConfirmPassword())) {
+                                                                                        logger.warn("User update failed - passwords do not match for user id: {}",
+                                                                                                        request.getId());
+                                                                                        throw new InvalidRequestException(
+                                                                                                        "Passwords do not match");
                                                                                 }
-                                                                                existingUser.setEmail(
-                                                                                                request.getEmail());
-                                                                                return null;
-                                                                        });
-                                                } else {
-                                                        checkEmailFlow = Uni.createFrom().nullItem();
-                                                }
+                                                                                existingUser.setPassword(passwordUtil
+                                                                                                .hashPassword(request.getPassword()));
+                                                                        }
 
-                                                return checkEmailFlow;
-                                        }).chain(v -> {
-                                                if (request.getPassword() != null) {
-                                                        if (!request.getPassword()
-                                                                        .equals(request.getConfirmPassword())) {
-                                                                logger.warn("User update failed - passwords do not match for user id: {}",
-                                                                                request.getId());
-                                                                span.setStatus(StatusCode.ERROR,
-                                                                                "Passwords do not match");
-                                                                span.setAttribute("user.update.success", false);
+                                                                        if (request.getFirstname() != null) {
+                                                                                existingUser.setFirstname(request.getFirstname());
+                                                                        }
+                                                                        if (request.getLastname() != null) {
+                                                                                existingUser.setLastname(request.getLastname());
+                                                                        }
 
-                                                                requestsTotal.add(1, Attributes.of(
-                                                                                AttributeKey.stringKey("operation"),
-                                                                                "update_user",
-                                                                                AttributeKey.stringKey("status"),
-                                                                                "failed",
-                                                                                AttributeKey.stringKey("error_type"),
-                                                                                "invalid_request"));
+                                                                        Uni<Void> rolesFlow;
+                                                                        if (request.getRoleNames() != null) {
+                                                                                List<Uni<Role>> roleUnis = request.getRoleNames().stream()
+                                                                                                .map(this::resolveRoleViaGrpc)
+                                                                                                .collect(Collectors.toList());
+                                                                                rolesFlow = Uni.join().all(roleUnis).andFailFast()
+                                                                                                .map(roles -> {
+                                                                                                        existingUser.getRoles().clear();
+                                                                                                        existingUser.getRoles().addAll(roles);
+                                                                                                        return null;
+                                                                                                });
+                                                                        } else {
+                                                                                rolesFlow = Uni.createFrom().nullItem();
+                                                                        }
 
-                                                                throw new InvalidRequestException(
-                                                                                "Passwords do not match");
-                                                        }
-                                                        existingUser.setPassword(passwordUtil
-                                                                        .hashPassword(request.getPassword()));
-                                                }
+                                                                        return rolesFlow.chain(v3 -> {
+                                                                                existingUser.setUpdatedAt(
+                                                                                                Timestamp.valueOf(LocalDateTime.now()));
+                                                                                return userRepository.persist(existingUser)
+                                                                                                .chain(v4 -> {
+                                                                                                        UserResponse userResponse = UserResponse
+                                                                                                                        .from(existingUser);
+                                                                                                        String cacheKey = "user:"
+                                                                                                                        + request.getId();
 
-                                                if (request.getFirstname() != null) {
-                                                        existingUser.setFirstname(request.getFirstname());
-                                                }
-                                                if (request.getLastname() != null) {
-                                                        existingUser.setLastname(request.getLastname());
-                                                }
-
-                                                Uni<Void> rolesFlow;
-                                                if (request.getRoleNames() != null) {
-                                                        List<Uni<Role>> roleUnis = request.getRoleNames().stream()
-                                                                        .map(this::resolveRoleViaGrpc)
-                                                                        .collect(Collectors.toList());
-                                                        rolesFlow = Uni.join().all(roleUnis).andFailFast()
-                                                                        .map(roles -> {
-                                                                                existingUser.getRoles().clear();
-                                                                                existingUser.getRoles().addAll(roles);
-                                                                                return null;
-                                                                        });
-                                                } else {
-                                                        rolesFlow = Uni.createFrom().nullItem();
-                                                }
-
-                                                return rolesFlow.chain(v3 -> {
-                                                        existingUser.setUpdatedAt(
-                                                                        Timestamp.valueOf(LocalDateTime.now()));
-                                                        return userRepository.persist(existingUser)
-                                                                        .chain(v4 -> {
-                                                                                UserResponse userResponse = UserResponse
-                                                                                                .from(existingUser);
-                                                                                String cacheKey = "user:"
-                                                                                                + request.getId();
-
-                                                                                return redisService.deleteReactive(
-                                                                                                cacheKey)
-                                                                                                .map(v5 -> {
-                                                                                                        logger.info("Invalidated cache for key: {}",
-                                                                                                                        cacheKey);
-                                                                                                        logger.info("Successfully updated user with id: {}",
-                                                                                                                        request.getId());
-                                                                                                        span.setStatus(StatusCode.OK);
-                                                                                                        span.setAttribute(
-                                                                                                                        "user.update.success",
-                                                                                                                        true);
-
-                                                                                                        requestsTotal.add(
-                                                                                                                        1,
-                                                                                                                        Attributes.of(
-                                                                                                                                        AttributeKey.stringKey(
-                                                                                                                                                        "operation"),
-                                                                                                                                        "update_user",
-                                                                                                                                        AttributeKey.stringKey(
-                                                                                                                                                        "status"),
-                                                                                                                                        "success"));
-
-                                                                                                        return ApiResponse
-                                                                                                                        .success("User updated successfully",
-                                                                                                                                        userResponse);
+                                                                                                        return redisService.deleteReactive(
+                                                                                                                        cacheKey)
+                                                                                                                        .map(v5 -> {
+                                                                                                                                logger.info("Invalidated cache for key: {}",
+                                                                                                                                                cacheKey);
+                                                                                                                                logger.info("Successfully updated user with id: {}",
+                                                                                                                                                request.getId());
+                                                                                                                                return ApiResponse.success(
+                                                                                                                                                "User updated successfully",
+                                                                                                                                                userResponse);
+                                                                                                                        });
                                                                                                 });
                                                                         });
-                                                });
-                                        });
-                                })
-                                .onFailure().invoke(e -> {
+                                                                });
+                                                        });
+                                }).onFailure().invoke(e -> {
                                         logger.error("Error updating user with id: {}", request.getId(), e);
-                                        span.recordException(e);
-                                        span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "update_user",
-                                                        AttributeKey.stringKey("status"), "failed",
-                                                        AttributeKey.stringKey("error_type"),
-                                                        e.getClass().getSimpleName()));
-                                })
-                                .eventually(() -> {
-                                        span.end();
-                                        double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                        requestDurationSeconds.record(duration, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "update_user"));
-                                        logger.debug("Update user operation completed in {} seconds", duration);
                                 });
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<UserResponseDeleteAt>> trashed(Long id) {
-                long startTime = System.currentTimeMillis();
-                Span span = tracer.spanBuilder("trashUser")
-                                .setSpanKind(SpanKind.SERVER)
-                                .setAttribute("service.name", "user-service")
-                                .setAttribute("operation", "trash_user")
-                                .setAttribute("user.id", id.toString())
-                                .startSpan();
-
                 logger.info("Trashing user with id: {}", id);
 
-                return userRepository.trash(id)
-                                .chain(trashedUser -> {
-                                        if (trashedUser == null) {
-                                                logger.warn("User trash failed - user not found with id: {}", id);
-                                                span.setStatus(StatusCode.ERROR, "User not found");
-                                                span.setAttribute("user.trash.success", false);
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "trash_user")
+                                .put("service.name", "user-service")
+                                .put("user.id", String.valueOf(id))
+                                .build();
 
-                                                requestsTotal.add(1, Attributes.of(
-                                                                AttributeKey.stringKey("operation"), "trash_user",
-                                                                AttributeKey.stringKey("status"), "failed",
-                                                                AttributeKey.stringKey("error_type"), "not_found"));
+                return tracingMetrics.<ApiResponse<UserResponseDeleteAt>>traceAndMeasure(
+                                "trashUser", "trash_user", attrs, () -> {
 
-                                                throw new ResourceNotFoundException(
-                                                                "Trashed user not found with id: " + id);
-                                        }
+                                        return userRepository.trash(id)
+                                                        .chain(trashedUser -> {
+                                                                if (trashedUser == null) {
+                                                                        logger.warn("User trash failed - user not found with id: {}", id);
+                                                                        throw new ResourceNotFoundException(
+                                                                                        "Trashed user not found with id: " + id);
+                                                                }
 
-                                        span.setAttribute("user.username", trashedUser.getUsername());
-                                        span.setAttribute("user.trash.success", true);
+                                                                UserResponseDeleteAt userResponseDeleteAt = UserResponseDeleteAt
+                                                                                .from(trashedUser);
+                                                                String cacheKey = "user:" + id;
 
-                                        UserResponseDeleteAt userResponseDeleteAt = UserResponseDeleteAt
-                                                        .from(trashedUser);
-                                        String cacheKey = "user:" + id;
-
-                                        return redisService.deleteReactive(cacheKey)
-                                                        .map(v -> {
-                                                                logger.info("Invalidated cache for key: {}", cacheKey);
-                                                                logger.info("Successfully trashed user with id: {}",
-                                                                                id);
-                                                                span.setStatus(StatusCode.OK);
-
-                                                                requestsTotal.add(1, Attributes.of(
-                                                                                AttributeKey.stringKey("operation"),
-                                                                                "trash_user",
-                                                                                AttributeKey.stringKey("status"),
-                                                                                "success"));
-
-                                                                return ApiResponse.success("User trashed successfully",
-                                                                                userResponseDeleteAt);
+                                                                return redisService.deleteReactive(cacheKey)
+                                                                                .map(v -> {
+                                                                                        logger.info("Invalidated cache for key: {}", cacheKey);
+                                                                                        logger.info("Successfully trashed user with id: {}",
+                                                                                                        id);
+                                                                                        return ApiResponse.success("User trashed successfully",
+                                                                                                        userResponseDeleteAt);
+                                                                                });
                                                         });
-                                })
-                                .onFailure().invoke(e -> {
+                                }).onFailure().invoke(e -> {
                                         logger.error("Error trashing user with id: {}", id, e);
-                                        span.recordException(e);
-                                        span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "trash_user",
-                                                        AttributeKey.stringKey("status"), "failed",
-                                                        AttributeKey.stringKey("error_type"),
-                                                        e.getClass().getSimpleName()));
-                                })
-                                .eventually(() -> {
-                                        span.end();
-                                        double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                        requestDurationSeconds.record(duration, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "trash_user"));
-                                        logger.debug("Trash user operation completed in {} seconds", duration);
                                 });
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<UserResponseDeleteAt>> restore(Long id) {
-                long startTime = System.currentTimeMillis();
-                Span span = tracer.spanBuilder("restoreUser")
-                                .setSpanKind(SpanKind.SERVER)
-                                .setAttribute("service.name", "user-service")
-                                .setAttribute("operation", "restore_user")
-                                .setAttribute("user.id", id.toString())
-                                .startSpan();
-
                 logger.info("Restoring user with id: {}", id);
 
-                return userRepository.restore(id)
-                                .chain(restoredUser -> {
-                                        if (restoredUser == null) {
-                                                logger.warn("User restore failed - user not found with id: {}", id);
-                                                span.setStatus(StatusCode.ERROR, "User not found");
-                                                span.setAttribute("user.restore.success", false);
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "restore_user")
+                                .put("service.name", "user-service")
+                                .put("user.id", String.valueOf(id))
+                                .build();
 
-                                                requestsTotal.add(1, Attributes.of(
-                                                                AttributeKey.stringKey("operation"), "restore_user",
-                                                                AttributeKey.stringKey("status"), "failed",
-                                                                AttributeKey.stringKey("error_type"), "not_found"));
+                return tracingMetrics.<ApiResponse<UserResponseDeleteAt>>traceAndMeasure(
+                                "restoreUser", "restore_user", attrs, () -> {
 
-                                                throw new ResourceNotFoundException(
-                                                                "Restore user not found with id: " + id);
-                                        }
+                                        return userRepository.restore(id)
+                                                        .chain(restoredUser -> {
+                                                                if (restoredUser == null) {
+                                                                        logger.warn("User restore failed - user not found with id: {}", id);
+                                                                        throw new ResourceNotFoundException(
+                                                                                        "Restore user not found with id: " + id);
+                                                                }
 
-                                        span.setAttribute("user.username", restoredUser.getUsername());
-                                        span.setAttribute("user.restore.success", true);
+                                                                UserResponseDeleteAt userResponseDeleteAt = UserResponseDeleteAt
+                                                                                .from(restoredUser);
+                                                                String cacheKey = "user:" + id;
 
-                                        UserResponseDeleteAt userResponseDeleteAt = UserResponseDeleteAt
-                                                        .from(restoredUser);
-                                        String cacheKey = "user:" + id;
-
-                                        return redisService.deleteReactive(cacheKey)
-                                                        .map(v -> {
-                                                                logger.info("Invalidated cache for key: {}", cacheKey);
-                                                                logger.info("Successfully restored user with id: {}",
-                                                                                id);
-                                                                span.setStatus(StatusCode.OK);
-
-                                                                requestsTotal.add(1, Attributes.of(
-                                                                                AttributeKey.stringKey("operation"),
-                                                                                "restore_user",
-                                                                                AttributeKey.stringKey("status"),
-                                                                                "success"));
-
-                                                                return ApiResponse.success("User restored successfully",
-                                                                                userResponseDeleteAt);
+                                                                return redisService.deleteReactive(cacheKey)
+                                                                                .map(v -> {
+                                                                                        logger.info("Invalidated cache for key: {}", cacheKey);
+                                                                                        logger.info("Successfully restored user with id: {}",
+                                                                                                        id);
+                                                                                        return ApiResponse.success("User restored successfully",
+                                                                                                        userResponseDeleteAt);
+                                                                                });
                                                         });
-                                })
-                                .onFailure().invoke(e -> {
+                                }).onFailure().invoke(e -> {
                                         logger.error("Error restoring user with id: {}", id, e);
-                                        span.recordException(e);
-                                        span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "restore_user",
-                                                        AttributeKey.stringKey("status"), "failed",
-                                                        AttributeKey.stringKey("error_type"),
-                                                        e.getClass().getSimpleName()));
-                                })
-                                .eventually(() -> {
-                                        span.end();
-                                        double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                        requestDurationSeconds.record(duration, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "restore_user"));
-                                        logger.debug("Restore user operation completed in {} seconds", duration);
                                 });
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<Void>> deletePermanent(Long id) {
-                long startTime = System.currentTimeMillis();
-                Span span = tracer.spanBuilder("deleteUserPermanent")
-                                .setSpanKind(SpanKind.SERVER)
-                                .setAttribute("service.name", "user-service")
-                                .setAttribute("operation", "delete_user_permanent")
-                                .setAttribute("user.id", id.toString())
-                                .startSpan();
-
                 logger.info("Permanently deleting user with id: {}", id);
 
-                return userRepository.findById(id)
-                                .chain(userToDelete -> {
-                                        if (userToDelete == null) {
-                                                logger.warn("Permanent delete failed - user not found with id: {}", id);
-                                                span.setStatus(StatusCode.ERROR, "User not found");
-                                                span.setAttribute("user.delete.success", false);
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "delete_user_permanent")
+                                .put("service.name", "user-service")
+                                .put("user.id", String.valueOf(id))
+                                .build();
 
-                                                requestsTotal.add(1, Attributes.of(
-                                                                AttributeKey.stringKey("operation"),
-                                                                "delete_user_permanent",
-                                                                AttributeKey.stringKey("status"), "failed",
-                                                                AttributeKey.stringKey("error_type"), "not_found"));
+                return tracingMetrics.<ApiResponse<Void>>traceAndMeasure(
+                                "deleteUserPermanent", "delete_user_permanent", attrs, () -> {
 
-                                                throw new ResourceNotFoundException("User not found with id: " + id);
-                                        }
+                                        return userRepository.findById(id)
+                                                        .chain(userToDelete -> {
+                                                                if (userToDelete == null) {
+                                                                        logger.warn("Permanent delete failed - user not found with id: {}",
+                                                                                        id);
+                                                                        throw new ResourceNotFoundException(
+                                                                                        "User not found with id: " + id);
+                                                                }
 
-                                        span.setAttribute("user.username", userToDelete.getUsername());
-
-                                        return userRepository.deletePermanent(id)
-                                                        .chain(v -> {
-                                                                String cacheKey = "user:" + id;
-                                                                return redisService.deleteReactive(cacheKey)
-                                                                                .map(v2 -> {
-                                                                                        logger.info("Invalidated cache for key: {}",
-                                                                                                        cacheKey);
-                                                                                        logger.info("Successfully permanently deleted user with id: {}",
-                                                                                                        id);
-                                                                                        span.setStatus(StatusCode.OK);
-                                                                                        span.setAttribute(
-                                                                                                        "user.delete.success",
-                                                                                                        true);
-
-                                                                                        requestsTotal.add(1,
-                                                                                                        Attributes.of(
-                                                                                                                        AttributeKey.stringKey(
-                                                                                                                                        "operation"),
-                                                                                                                        "delete_user_permanent",
-                                                                                                                        AttributeKey.stringKey(
-                                                                                                                                        "status"),
-                                                                                                                        "success"));
-
-                                                                                        return ApiResponse.success(
-                                                                                                        "User deleted permanently");
+                                                                return userRepository.deletePermanent(id)
+                                                                                .chain(v -> {
+                                                                                        String cacheKey = "user:" + id;
+                                                                                        return redisService.deleteReactive(cacheKey)
+                                                                                                        .map(v2 -> {
+                                                                                                                logger.info("Invalidated cache for key: {}",
+                                                                                                                                cacheKey);
+                                                                                                                logger.info("Successfully permanently deleted user with id: {}",
+                                                                                                                                id);
+                                                                                                                return ApiResponse.success(
+                                                                                                                                "User deleted permanently");
+                                                                                                        });
                                                                                 });
                                                         });
-                                })
-                                .onFailure().invoke(e -> {
+                                }).onFailure().invoke(e -> {
                                         logger.error("Error permanently deleting user with id: {}", id, e);
-                                        span.recordException(e);
-                                        span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "delete_user_permanent",
-                                                        AttributeKey.stringKey("status"), "failed",
-                                                        AttributeKey.stringKey("error_type"),
-                                                        e.getClass().getSimpleName()));
-                                })
-                                .eventually(() -> {
-                                        span.end();
-                                        double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                        requestDurationSeconds.record(duration, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "delete_user_permanent"));
-                                        logger.debug("Permanent delete user operation completed in {} seconds",
-                                                        duration);
                                 });
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<Void>> restoreAllTrashedUsers() {
-                long startTime = System.currentTimeMillis();
-                Span span = tracer.spanBuilder("restoreAllTrashedUsers")
-                                .setSpanKind(SpanKind.SERVER)
-                                .setAttribute("service.name", "user-service")
-                                .setAttribute("operation", "restore_all_trashed_users")
-                                .startSpan();
-
                 logger.info("Restoring all trashed users");
 
-                return userRepository.restoreAllDeleted()
-                                .map(v -> {
-                                        logger.warn("All trashed users restored. Caches will be refreshed upon expiry or next access.");
-                                        logger.info("Successfully restored all trashed users");
-                                        span.setStatus(StatusCode.OK);
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "restore_all_trashed_users")
+                                .put("service.name", "user-service")
+                                .build();
 
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"),
-                                                        "restore_all_trashed_users",
-                                                        AttributeKey.stringKey("status"), "success"));
+                return tracingMetrics.<ApiResponse<Void>>traceAndMeasure(
+                                "restoreAllTrashedUsers", "restore_all_trashed_users", attrs, () -> {
 
-                                        return ApiResponse.success("All trashed users have been restored successfully");
-                                })
-                                .onFailure().invoke(e -> {
+                                        return userRepository.restoreAllDeleted()
+                                                        .map(v -> {
+                                                                logger.warn("All trashed users restored. Caches will be refreshed upon expiry or next access.");
+                                                                logger.info("Successfully restored all trashed users");
+                                                                return ApiResponse.success("All trashed users have been restored successfully");
+                                                        });
+                                }).onFailure().invoke(e -> {
                                         logger.error("Error restoring all trashed users", e);
-                                        span.recordException(e);
-                                        span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"),
-                                                        "restore_all_trashed_users",
-                                                        AttributeKey.stringKey("status"), "failed",
-                                                        AttributeKey.stringKey("error_type"),
-                                                        e.getClass().getSimpleName()));
-                                })
-                                .eventually(() -> {
-                                        span.end();
-                                        double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                        requestDurationSeconds.record(duration, Attributes.of(
-                                                        AttributeKey.stringKey("operation"),
-                                                        "restore_all_trashed_users"));
-                                        logger.debug("Restore all trashed users operation completed in {} seconds",
-                                                        duration);
                                 });
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<Void>> deleteAllTrashedUsers() {
-                long startTime = System.currentTimeMillis();
-                Span span = tracer.spanBuilder("deleteAllTrashedUsers")
-                                .setSpanKind(SpanKind.SERVER)
-                                .setAttribute("service.name", "user-service")
-                                .setAttribute("operation", "delete_all_trashed_users")
-                                .startSpan();
-
                 logger.info("Permanently deleting all trashed users");
 
-                return userRepository.deleteAllDeleted()
-                                .map(v -> {
-                                        logger.warn("All trashed users deleted. Caches will be refreshed upon expiry or next access.");
-                                        logger.info("Successfully deleted all trashed users");
-                                        span.setStatus(StatusCode.OK);
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "delete_all_trashed_users")
+                                .put("service.name", "user-service")
+                                .build();
 
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "delete_all_trashed_users",
-                                                        AttributeKey.stringKey("status"), "success"));
+                return tracingMetrics.<ApiResponse<Void>>traceAndMeasure(
+                                "deleteAllTrashedUsers", "delete_all_trashed_users", attrs, () -> {
 
-                                        return ApiResponse.success("All trashed users have been deleted permanently");
-                                })
-                                .onFailure().invoke(e -> {
+                                        return userRepository.deleteAllDeleted()
+                                                        .map(v -> {
+                                                                logger.warn("All trashed users deleted. Caches will be refreshed upon expiry or next access.");
+                                                                logger.info("Successfully deleted all trashed users");
+                                                                return ApiResponse.success("All trashed users have been deleted permanently");
+                                                        });
+                                }).onFailure().invoke(e -> {
                                         logger.error("Error deleting all trashed users", e);
-                                        span.recordException(e);
-                                        span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "delete_all_trashed_users",
-                                                        AttributeKey.stringKey("status"), "failed",
-                                                        AttributeKey.stringKey("error_type"),
-                                                        e.getClass().getSimpleName()));
-                                })
-                                .eventually(() -> {
-                                        span.end();
-                                        double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                        requestDurationSeconds.record(duration, Attributes.of(
-                                                        AttributeKey.stringKey("operation"),
-                                                        "delete_all_trashed_users"));
-                                        logger.debug("Delete all trashed users operation completed in {} seconds",
-                                                        duration);
                                 });
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<UserResponse>> verifyPassword(String email, String password) {
-                long startTime = System.currentTimeMillis();
-                Span span = tracer.spanBuilder("verifyPassword")
-                                .setSpanKind(SpanKind.SERVER)
-                                .setAttribute("service.name", "user-service")
-                                .setAttribute("operation", "verify_password")
-                                .setAttribute("user.email", email)
-                                .startSpan();
-
                 logger.info("Verifying password for user email: {}", email);
 
-                return userRepository.findByEmail(email)
-                                .chain(user -> {
-                                        if (user == null) {
-                                                logger.warn("Password verification failed - user not found with email: {}", email);
-                                                span.setStatus(StatusCode.ERROR, "User not found");
-                                                span.setAttribute("user.verify.success", false);
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "verify_password")
+                                .put("service.name", "user-service")
+                                .put("user.email", email)
+                                .build();
 
-                                                requestsTotal.add(1, Attributes.of(
-                                                                AttributeKey.stringKey("operation"), "verify_password",
-                                                                AttributeKey.stringKey("status"), "failed",
-                                                                AttributeKey.stringKey("error_type"), "not_found"));
+                return tracingMetrics.<ApiResponse<UserResponse>>traceAndMeasure(
+                                "verifyPassword", "verify_password", attrs, () -> {
 
-                                                throw new ResourceNotFoundException("User not found with email: " + email);
-                                        }
+                                        return userRepository.findByEmail(email)
+                                                        .chain(user -> {
+                                                                if (user == null) {
+                                                                        logger.warn("Password verification failed - user not found with email: {}",
+                                                                                        email);
+                                                                        throw new ResourceNotFoundException(
+                                                                                        "User not found with email: " + email);
+                                                                }
 
-                                        if (!passwordUtil.verifyPassword(password, user.getPassword())) {
-                                                logger.warn("Password verification failed - password mismatch for email: {}", email);
-                                                span.setStatus(StatusCode.ERROR, "Invalid password");
-                                                span.setAttribute("user.verify.success", false);
+                                                                if (!passwordUtil.verifyPassword(password, user.getPassword())) {
+                                                                        logger.warn("Password verification failed - password mismatch for email: {}",
+                                                                                        email);
+                                                                        throw new InvalidRequestException("Invalid password");
+                                                                }
 
-                                                requestsTotal.add(1, Attributes.of(
-                                                                AttributeKey.stringKey("operation"), "verify_password",
-                                                                AttributeKey.stringKey("status"), "failed",
-                                                                AttributeKey.stringKey("error_type"), "invalid_credentials"));
+                                                                UserResponse userResponse = UserResponse.from(user);
 
-                                                throw new InvalidRequestException("Invalid password");
-                                        }
-
-                                        span.setAttribute("user.id", user.id);
-                                        span.setAttribute("user.verify.success", true);
-
-                                        UserResponse userResponse = UserResponse.from(user);
-
-                                        logger.info("Successfully verified password for user email: {}", email);
-                                        span.setStatus(StatusCode.OK);
-
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "verify_password",
-                                                        AttributeKey.stringKey("status"), "success"));
-
-                                        return Uni.createFrom().item(ApiResponse.success("Password verified successfully", userResponse));
-                                })
-                                .onFailure().invoke(e -> {
+                                                                logger.info("Successfully verified password for user email: {}",
+                                                                                email);
+                                                                return Uni.createFrom().item(ApiResponse.success(
+                                                                                                "Password verified successfully",
+                                                                                                userResponse));
+                                                        });
+                                }).onFailure().invoke(e -> {
                                         logger.error("Error verifying password for user email: {}", email, e);
-                                        span.recordException(e);
-                                        span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                        requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "verify_password",
-                                                        AttributeKey.stringKey("status"), "failed",
-                                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                })
-                                .eventually(() -> {
-                                        span.end();
-                                        double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                        requestDurationSeconds.record(duration, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "verify_password"));
-                                        logger.debug("Verify password operation completed in {} seconds", duration);
                                 });
         }
 

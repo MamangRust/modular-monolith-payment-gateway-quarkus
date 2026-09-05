@@ -15,10 +15,31 @@ public class TransactionYearlyAmountResponse {
     private String year;
     private Long totalAmount;
 
+    public TransactionYearlyAmountResponse(String year, long totalAmount) {
+        this.year = year;
+        this.totalAmount = totalAmount;
+    }
+
+    public String getYear() {
+        return year;
+    }
+
+    public void setYear(String year) {
+        this.year = year;
+    }
+
+    public Long getTotalAmount() {
+        return totalAmount;
+    }
+
+    public void setTotalAmount(Long totalAmount) {
+        this.totalAmount = totalAmount;
+    }
+
     public static TransactionYearlyAmountResponse from(TransactionYearAmount dto) {
-        return TransactionYearlyAmountResponse.builder()
-                .year(dto.getYear())
-                .totalAmount(dto.getTotalAmount())
-                .build();
+        return new TransactionYearlyAmountResponse(
+            dto.getYear(),
+            dto.getTotalAmount()
+        );
     }
 }

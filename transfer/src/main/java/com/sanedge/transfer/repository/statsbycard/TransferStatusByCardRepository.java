@@ -2,6 +2,7 @@ package com.sanedge.transfer.repository.statsbycard;
 
 import java.util.List;
 
+import com.sanedge.transfer.domain.requests.statsbycard.MonthStatusTransferCardNumber;
 import com.sanedge.transfer.entity.Transfer;
 import com.sanedge.transfer.entity.TransferMonthStatusFailed;
 import com.sanedge.transfer.entity.TransferMonthStatusSuccess;
@@ -16,7 +17,13 @@ import jakarta.enterprise.context.ApplicationScoped;
 public class TransferStatusByCardRepository implements PanacheRepository<Transfer> {
 
     public Uni<List<TransferMonthStatusSuccess>> findMonthTransferStatusSuccessByCard(
-            String cardNumber, Long startYear, Integer startMonth, Long endYear, Integer endMonth) {
+            MonthStatusTransferCardNumber req) {
+        String cardNumber = req.getCardNumber();
+        Long startYear = (long) req.getYear();
+        Integer startMonth = req.getMonth();
+        Long endYear = (long) req.getYear();
+        Integer endMonth = req.getMonth();
+
         String sql = """
             WITH months AS (
                 SELECT 1 AS m UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL
@@ -62,7 +69,13 @@ public class TransferStatusByCardRepository implements PanacheRepository<Transfe
     }
 
     public Uni<List<TransferMonthStatusFailed>> findMonthTransferStatusFailedByCard(
-            String cardNumber, Long startYear, Integer startMonth, Long endYear, Integer endMonth) {
+            MonthStatusTransferCardNumber req) {
+        String cardNumber = req.getCardNumber();
+        Long startYear = (long) req.getYear();
+        Integer startMonth = req.getMonth();
+        Long endYear = (long) req.getYear();
+        Integer endMonth = req.getMonth();
+
         String sql = """
             WITH months AS (
                 SELECT 1 AS m UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL

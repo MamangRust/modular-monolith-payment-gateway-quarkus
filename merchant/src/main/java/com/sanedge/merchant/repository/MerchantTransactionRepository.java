@@ -3,6 +3,9 @@ package com.sanedge.merchant.repository;
 import java.util.List;
 
 import com.sanedge.common.domain.response.PagedResult;
+import com.sanedge.merchant.domain.requests.transactions.FindAllMerchantTransactions;
+import com.sanedge.merchant.domain.requests.transactions.FindAllMerchantTransactionsByApiKey;
+import com.sanedge.merchant.domain.requests.transactions.FindAllMerchantTransactionsById;
 import com.sanedge.merchant.entity.Merchant;
 import com.sanedge.merchant.entity.MerchantTransactions;
 
@@ -13,7 +16,11 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class MerchantTransactionRepository implements PanacheRepository<Merchant> {
 
-    public Uni<PagedResult<MerchantTransactions>> findAllTransactions(String search, int page, int size) {
+    public Uni<PagedResult<MerchantTransactions>> findAllTransactions(FindAllMerchantTransactions req) {
+        String search = (req.getSearch() != null && !req.getSearch().isEmpty()) ? req.getSearch() : null;
+        int page = req.getPage() != null && req.getPage() > 0 ? req.getPage() : 1;
+        int size = req.getPageSize() != null && req.getPageSize() > 0 ? req.getPageSize() : 10;
+
         String baseSql = """
             FROM transactions t
             JOIN merchants m ON t.merchant_id = m.merchant_id
@@ -24,7 +31,7 @@ public class MerchantTransactionRepository implements PanacheRepository<Merchant
         String selectSql = "SELECT t.transaction_id, t.card_number, t.amount, t.payment_method, t.merchant_id, m.name, t.transaction_time, t.created_at, t.updated_at, t.deleted_at " + baseSql + " ORDER BY t.transaction_time DESC";
         String countSql = "SELECT COUNT(*) " + baseSql;
 
-        int offset = page * size;
+        int offset = page > 0 ? (page - 1) * size : 0;
 
         Uni<List<MerchantTransactions>> listUni = getSession().chain(session ->
             session.createNativeQuery(selectSql, Object[].class)
@@ -61,7 +68,12 @@ public class MerchantTransactionRepository implements PanacheRepository<Merchant
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
     }
 
-    public Uni<PagedResult<MerchantTransactions>> findAllTransactionsByMerchant(Long merchantId, String search, int page, int size) {
+    public Uni<PagedResult<MerchantTransactions>> findAllTransactionsByMerchant(FindAllMerchantTransactionsById req) {
+        Long merchantId = req.getMerchantId();
+        String search = (req.getSearch() != null && !req.getSearch().isEmpty()) ? req.getSearch() : null;
+        int page = req.getPage() != null && req.getPage() > 0 ? req.getPage() : 1;
+        int size = req.getPageSize() != null && req.getPageSize() > 0 ? req.getPageSize() : 10;
+
         String baseSql = """
             FROM transactions t
             JOIN merchants m ON t.merchant_id = m.merchant_id
@@ -73,7 +85,7 @@ public class MerchantTransactionRepository implements PanacheRepository<Merchant
         String selectSql = "SELECT t.transaction_id, t.card_number, t.amount, t.payment_method, t.merchant_id, m.name, t.transaction_time, t.created_at, t.updated_at, t.deleted_at " + baseSql + " ORDER BY t.transaction_time DESC";
         String countSql = "SELECT COUNT(*) " + baseSql;
 
-        int offset = page * size;
+        int offset = page > 0 ? (page - 1) * size : 0;
 
         Uni<List<MerchantTransactions>> listUni = getSession().chain(session ->
             session.createNativeQuery(selectSql, Object[].class)
@@ -112,7 +124,12 @@ public class MerchantTransactionRepository implements PanacheRepository<Merchant
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
     }
 
-    public Uni<PagedResult<MerchantTransactions>> findAllTransactionsByApiKey(String apiKey, String search, int page, int size) {
+    public Uni<PagedResult<MerchantTransactions>> findAllTransactionsByApiKey(FindAllMerchantTransactionsByApiKey req) {
+        String apiKey = req.getApiKey();
+        String search = (req.getSearch() != null && !req.getSearch().isEmpty()) ? req.getSearch() : null;
+        int page = req.getPage() != null && req.getPage() > 0 ? req.getPage() : 1;
+        int size = req.getPageSize() != null && req.getPageSize() > 0 ? req.getPageSize() : 10;
+
         String baseSql = """
             FROM transactions t
             JOIN merchants m ON t.merchant_id = m.merchant_id
@@ -124,7 +141,7 @@ public class MerchantTransactionRepository implements PanacheRepository<Merchant
         String selectSql = "SELECT t.transaction_id, t.card_number, t.amount, t.payment_method, t.merchant_id, m.name, t.transaction_time, t.created_at, t.updated_at, t.deleted_at " + baseSql + " ORDER BY t.transaction_time DESC";
         String countSql = "SELECT COUNT(*) " + baseSql;
 
-        int offset = page * size;
+        int offset = page > 0 ? (page - 1) * size : 0;
 
         Uni<List<MerchantTransactions>> listUni = getSession().chain(session ->
             session.createNativeQuery(selectSql, Object[].class)

@@ -16,21 +16,13 @@ import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.common.domain.response.ApiResponsePagination;
 import com.sanedge.common.domain.response.PagedResult;
 import com.sanedge.common.domain.response.PaginationMeta;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.role.domain.response.RoleResponse;
 import com.sanedge.role.domain.response.RoleResponseDeleteAt;
 import com.sanedge.role.repository.RoleRepository;
 import com.sanedge.role.service.RoleQueryService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -41,34 +33,20 @@ public class RoleQueryServiceImpl implements RoleQueryService {
         private static final Logger logger = LoggerFactory.getLogger(RoleQueryServiceImpl.class);
 
         RoleRepository roleRepository;
-        OpenTelemetry openTelemetry;
         RedisService redisService;
 
-        private final Tracer tracer;
-        private final LongCounter requestsTotal;
-        private final DoubleHistogram requestDurationSeconds;
-
         private final ObjectMapper objectMapper;
+        private final TracingMetrics tracingMetrics;
 
         private static final long LIST_CACHE_TTL_SECONDS = 300;
 
         @Inject
-        public RoleQueryServiceImpl(RoleRepository roleRepository, OpenTelemetry openTelemetry, RedisService redisService,
-                        ObjectMapper objectMapper) {
+        public RoleQueryServiceImpl(RoleRepository roleRepository, RedisService redisService,
+                        TracingMetrics tracingMetrics, ObjectMapper objectMapper) {
                 this.roleRepository = roleRepository;
-                this.openTelemetry = openTelemetry;
                 this.redisService = redisService;
+                this.tracingMetrics = tracingMetrics;
                 this.objectMapper = objectMapper;
-                this.tracer = openTelemetry.getTracer("role-query-service", "1.0.0");
-                Meter meter = openTelemetry.getMeter("role-query-service");
-
-                this.requestsTotal = meter.counterBuilder("requests_total")
-                                .setDescription("Total number of requests")
-                                .build();
-                this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                                .setDescription("Request duration in seconds")
-                                .setUnit("s")
-                                .build();
         }
 
         private String toJson(Object obj) {
@@ -103,68 +81,49 @@ public class RoleQueryServiceImpl implements RoleQueryService {
                 String cacheKey = String.format("roles:all:%d:%d:%s", request.getPage(), request.getPageSize(),
                                 request.getSearch());
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 ApiResponsePagination<List<RoleResponse>> response = fromJson(cachedJson,
-                                                                 new TypeReference<ApiResponsePagination<List<RoleResponse>>>() {
-                                                                 });
-                                                 return Uni.createFrom().item(response);
-                                         }
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "find_all_roles")
+                                .put("service.name", "role-service")
+                                .build();
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findAllRoles")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "role-service")
-                                                         .setAttribute("operation", "find_all_roles")
-                                                         .startSpan();
+                return tracingMetrics.<ApiResponsePagination<List<RoleResponse>>>traceAndMeasure(
+                                "findAllRoles", "find_all_roles", attrs, () -> {
 
-                                         int page = request.getPage() - 1;
-                                         int size = request.getPageSize();
-                                         String search = request.getSearch();
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                 if (cachedJson != null) {
+                                                                         logger.info("Cache HIT for key: {}", cacheKey);
+                                                                         ApiResponsePagination<List<RoleResponse>> response = fromJson(
+                                                                                         cachedJson,
+                                                                                         new TypeReference<ApiResponsePagination<List<RoleResponse>>>() {
+                                                                                         });
+                                                                         return Uni.createFrom().item(response);
+                                                                 }
 
-                                         return roleRepository.findRoles(search, page, size)
-                                                         .chain(pagedResult -> {
-                                                                 span.setAttribute("role.count", pagedResult.getTotalRecords());
-                                                                 span.setAttribute("role.page", request.getPage());
-                                                                 span.setAttribute("role.size", request.getPageSize());
+                                                                 logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                                                 ApiResponsePagination<List<RoleResponse>> response = buildPaginatedResponse(
-                                                                                 pagedResult, request, "Roles retrieved successfully",
-                                                                                 RoleResponse::from);
+                                                                 return roleRepository.findRoles(request)
+                                                                                 .chain(pagedResult -> {
+                                                                                         ApiResponsePagination<List<RoleResponse>> response = buildPaginatedResponse(
+                                                                                                         pagedResult, request,
+                                                                                                         "Roles retrieved successfully",
+                                                                                                         RoleResponse::from);
 
-                                                                 return redisService.setWithExpirationReactive(cacheKey, toJson(response), LIST_CACHE_TTL_SECONDS)
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached response for key: {}", cacheKey);
-                                                                                         logger.info("Successfully retrieved {} roles", pagedResult.getTotalRecords());
-                                                                                         span.setStatus(StatusCode.OK);
-
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_all_roles",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-                                                                                         return response;
+                                                                                         return redisService.setWithExpirationReactive(
+                                                                                                         cacheKey, toJson(response),
+                                                                                                         LIST_CACHE_TTL_SECONDS)
+                                                                                                         .map(v -> {
+                                                                                                                 logger.info("Cached response for key: {}",
+                                                                                                                                 cacheKey);
+                                                                                                                 logger.info("Successfully retrieved {} roles",
+                                                                                                                                 pagedResult.getTotalRecords());
+                                                                                                                 return response;
+                                                                                                         });
                                                                                  });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding all roles", e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_all_roles",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_all_roles"));
-                                                                 logger.debug("Find all roles operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                        });
+                                }).onFailure().invoke(e -> {
+                                        logger.error("Error finding all roles", e);
+                                });
         }
 
         @Override
@@ -172,68 +131,49 @@ public class RoleQueryServiceImpl implements RoleQueryService {
                 String cacheKey = String.format("roles:active:%d:%d:%s", request.getPage(), request.getPageSize(),
                                 request.getSearch());
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 ApiResponsePagination<List<RoleResponseDeleteAt>> response = fromJson(cachedJson,
-                                                                 new TypeReference<ApiResponsePagination<List<RoleResponseDeleteAt>>>() {
-                                                                 });
-                                                 return Uni.createFrom().item(response);
-                                         }
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "find_active_roles")
+                                .put("service.name", "role-service")
+                                .build();
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findActiveRoles")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "role-service")
-                                                         .setAttribute("operation", "find_active_roles")
-                                                         .startSpan();
+                return tracingMetrics.<ApiResponsePagination<List<RoleResponseDeleteAt>>>traceAndMeasure(
+                                "findActiveRoles", "find_active_roles", attrs, () -> {
 
-                                         int page = request.getPage() - 1;
-                                         int size = request.getPageSize();
-                                         String search = request.getSearch();
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                 if (cachedJson != null) {
+                                                                         logger.info("Cache HIT for key: {}", cacheKey);
+                                                                         ApiResponsePagination<List<RoleResponseDeleteAt>> response = fromJson(
+                                                                                         cachedJson,
+                                                                                         new TypeReference<ApiResponsePagination<List<RoleResponseDeleteAt>>>() {
+                                                                                         });
+                                                                         return Uni.createFrom().item(response);
+                                                                 }
 
-                                         return roleRepository.findActiveRoles(search, page, size)
-                                                         .chain(pagedResult -> {
-                                                                 span.setAttribute("role.count", pagedResult.getTotalRecords());
-                                                                 span.setAttribute("role.page", request.getPage());
-                                                                 span.setAttribute("role.size", request.getPageSize());
+                                                                 logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                                                 ApiResponsePagination<List<RoleResponseDeleteAt>> response = buildPaginatedResponse(
-                                                                                 pagedResult, request, "Active roles retrieved successfully",
-                                                                                 RoleResponseDeleteAt::from);
+                                                                 return roleRepository.findActiveRoles(request)
+                                                                                 .chain(pagedResult -> {
+                                                                                         ApiResponsePagination<List<RoleResponseDeleteAt>> response = buildPaginatedResponse(
+                                                                                                         pagedResult, request,
+                                                                                                         "Active roles retrieved successfully",
+                                                                                                         RoleResponseDeleteAt::from);
 
-                                                                 return redisService.setWithExpirationReactive(cacheKey, toJson(response), LIST_CACHE_TTL_SECONDS)
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached response for key: {}", cacheKey);
-                                                                                         logger.info("Successfully retrieved {} active roles", pagedResult.getTotalRecords());
-                                                                                         span.setStatus(StatusCode.OK);
-
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_active_roles",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-                                                                                         return response;
+                                                                                         return redisService.setWithExpirationReactive(
+                                                                                                         cacheKey, toJson(response),
+                                                                                                         LIST_CACHE_TTL_SECONDS)
+                                                                                                         .map(v -> {
+                                                                                                                 logger.info("Cached response for key: {}",
+                                                                                                                                 cacheKey);
+                                                                                                                 logger.info("Successfully retrieved {} active roles",
+                                                                                                                                 pagedResult.getTotalRecords());
+                                                                                                                 return response;
+                                                                                                         });
                                                                                  });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding active roles", e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_active_roles",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_active_roles"));
-                                                                 logger.debug("Find active roles operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                        });
+                                }).onFailure().invoke(e -> {
+                                        logger.error("Error finding active roles", e);
+                                });
         }
 
         @Override
@@ -241,203 +181,152 @@ public class RoleQueryServiceImpl implements RoleQueryService {
                 String cacheKey = String.format("roles:trashed:%d:%d:%s", request.getPage(), request.getPageSize(),
                                 request.getSearch());
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 ApiResponsePagination<List<RoleResponseDeleteAt>> response = fromJson(cachedJson,
-                                                                 new TypeReference<ApiResponsePagination<List<RoleResponseDeleteAt>>>() {
-                                                                 });
-                                                 return Uni.createFrom().item(response);
-                                         }
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "find_trashed_roles")
+                                .put("service.name", "role-service")
+                                .build();
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findTrashedRoles")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "role-service")
-                                                         .setAttribute("operation", "find_trashed_roles")
-                                                         .startSpan();
+                return tracingMetrics.<ApiResponsePagination<List<RoleResponseDeleteAt>>>traceAndMeasure(
+                                "findTrashedRoles", "find_trashed_roles", attrs, () -> {
 
-                                         int page = request.getPage() - 1;
-                                         int size = request.getPageSize();
-                                         String search = request.getSearch();
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                 if (cachedJson != null) {
+                                                                         logger.info("Cache HIT for key: {}", cacheKey);
+                                                                         ApiResponsePagination<List<RoleResponseDeleteAt>> response = fromJson(
+                                                                                         cachedJson,
+                                                                                         new TypeReference<ApiResponsePagination<List<RoleResponseDeleteAt>>>() {
+                                                                                         });
+                                                                         return Uni.createFrom().item(response);
+                                                                 }
 
-                                         return roleRepository.findTrashedRoles(search, page, size)
-                                                         .chain(pagedResult -> {
-                                                                 span.setAttribute("role.count", pagedResult.getTotalRecords());
-                                                                 span.setAttribute("role.page", request.getPage());
-                                                                 span.setAttribute("role.size", request.getPageSize());
+                                                                 logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                                                 ApiResponsePagination<List<RoleResponseDeleteAt>> response = buildPaginatedResponse(
-                                                                                 pagedResult, request, "Trashed roles retrieved successfully",
-                                                                                 RoleResponseDeleteAt::from);
+                                                                 return roleRepository.findTrashedRoles(request)
+                                                                                 .chain(pagedResult -> {
+                                                                                         ApiResponsePagination<List<RoleResponseDeleteAt>> response = buildPaginatedResponse(
+                                                                                                         pagedResult, request,
+                                                                                                         "Trashed roles retrieved successfully",
+                                                                                                         RoleResponseDeleteAt::from);
 
-                                                                 return redisService.setWithExpirationReactive(cacheKey, toJson(response), LIST_CACHE_TTL_SECONDS)
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached response for key: {}", cacheKey);
-                                                                                         logger.info("Successfully retrieved {} trashed roles", pagedResult.getTotalRecords());
-                                                                                         span.setStatus(StatusCode.OK);
-
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_trashed_roles",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-                                                                                         return response;
+                                                                                         return redisService.setWithExpirationReactive(
+                                                                                                         cacheKey, toJson(response),
+                                                                                                         LIST_CACHE_TTL_SECONDS)
+                                                                                                         .map(v -> {
+                                                                                                                 logger.info("Cached response for key: {}",
+                                                                                                                                 cacheKey);
+                                                                                                                 logger.info("Successfully retrieved {} trashed roles",
+                                                                                                                                 pagedResult.getTotalRecords());
+                                                                                                                 return response;
+                                                                                                         });
                                                                                  });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding trashed roles", e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_trashed_roles",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_trashed_roles"));
-                                                                 logger.debug("Find trashed roles operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                        });
+                                }).onFailure().invoke(e -> {
+                                        logger.error("Error finding trashed roles", e);
+                                });
         }
 
         @Override
         public Uni<ApiResponse<RoleResponse>> findById(Long id) {
                 String cacheKey = "role:" + id;
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 RoleResponse cachedRole = fromJson(cachedJson, RoleResponse.class);
-                                                 return Uni.createFrom().item(ApiResponse.success("Role found", cachedRole));
-                                         }
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "find_role_by_id")
+                                .put("service.name", "role-service")
+                                .put("role.id", String.valueOf(id))
+                                .build();
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findRoleById")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "role-service")
-                                                         .setAttribute("operation", "find_role_by_id")
-                                                         .setAttribute("role.id", id.toString())
-                                                         .startSpan();
+                return tracingMetrics.<ApiResponse<RoleResponse>>traceAndMeasure(
+                                "findRoleById", "find_role_by_id", attrs, () -> {
 
-                                         return roleRepository.findById(id)
-                                                         .chain(role -> {
-                                                                 if (role == null) {
-                                                                         logger.warn("Role not found with id: {}", id);
-                                                                         span.setStatus(StatusCode.ERROR, "Role not found");
-                                                                         span.setAttribute("role.found", false);
-
-                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                         AttributeKey.stringKey("operation"), "find_role_by_id",
-                                                                                         AttributeKey.stringKey("status"), "failed",
-                                                                                         AttributeKey.stringKey("error_type"), "not_found"));
-
-                                                                         throw new NotFoundException("Role not found with id: " + id);
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                 if (cachedJson != null) {
+                                                                         logger.info("Cache HIT for key: {}", cacheKey);
+                                                                         RoleResponse cachedRole = fromJson(cachedJson,
+                                                                                         RoleResponse.class);
+                                                                         return Uni.createFrom()
+                                                                                         .item(ApiResponse.success("Role found", cachedRole));
                                                                  }
 
-                                                                 span.setAttribute("role.found", true);
-                                                                 span.setAttribute("role.name", role.getRoleName());
+                                                                 logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                                                 RoleResponse roleResponse = RoleResponse.from(role);
+                                                                 return roleRepository.findById(id)
+                                                                                 .chain(role -> {
+                                                                                         if (role == null) {
+                                                                                                 logger.warn("Role not found with id: {}",
+                                                                                                                 id);
+                                                                                                 throw new NotFoundException(
+                                                                                                                 "Role not found with id: " + id);
+                                                                                         }
 
-                                                                 return redisService.setReactive(cacheKey, toJson(roleResponse))
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached role for key: {}", cacheKey);
-                                                                                         logger.info("Successfully found role with id: {} and name: {}", id, role.getRoleName());
-                                                                                         span.setStatus(StatusCode.OK);
+                                                                                         RoleResponse roleResponse = RoleResponse
+                                                                                                         .from(role);
 
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_role_by_id",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-
-                                                                                         return ApiResponse.success("Role found", roleResponse);
+                                                                                         return redisService.setReactive(cacheKey,
+                                                                                                         toJson(roleResponse))
+                                                                                                         .map(v -> {
+                                                                                                                 logger.info("Cached role for key: {}",
+                                                                                                                                 cacheKey);
+                                                                                                                 logger.info("Successfully found role with id: {} and name: {}",
+                                                                                                                                 id, role.getRoleName());
+                                                                                                                 return ApiResponse.success(
+                                                                                                                                 "Role found",
+                                                                                                                                 roleResponse);
+                                                                                                         });
                                                                                  });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding role by id: {}", id, e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_role_by_id",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_role_by_id"));
-                                                                 logger.debug("Find role by id operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                        });
+                                }).onFailure().invoke(e -> {
+                                        logger.error("Error finding role by id: {}", id, e);
+                                });
         }
 
         @Override
         public Uni<ApiResponse<List<RoleResponse>>> findByUserId(Long userId) {
                 String cacheKey = "roles:user:" + userId;
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 List<RoleResponse> cachedRoles = fromJson(cachedJson, new TypeReference<List<RoleResponse>>() {});
-                                                 return Uni.createFrom().item(ApiResponse.success("Roles found", cachedRoles));
-                                         }
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "find_role_by_user_id")
+                                .put("service.name", "role-service")
+                                .put("user.id", String.valueOf(userId))
+                                .build();
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findRolesByUserId")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "role-service")
-                                                         .setAttribute("operation", "find_role_by_user_id")
-                                                         .setAttribute("user.id", userId.toString())
-                                                         .startSpan();
+                return tracingMetrics.<ApiResponse<List<RoleResponse>>>traceAndMeasure(
+                                "findRolesByUserId", "find_role_by_user_id", attrs, () -> {
 
-                                         return roleRepository.findUserRoles(userId)
-                                                         .chain(roles -> {
-                                                                 List<RoleResponse> responses = roles.stream()
-                                                                                 .map(RoleResponse::from)
-                                                                                 .collect(Collectors.toList());
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                 if (cachedJson != null) {
+                                                                         logger.info("Cache HIT for key: {}", cacheKey);
+                                                                         List<RoleResponse> cachedRoles = fromJson(cachedJson,
+                                                                                         new TypeReference<List<RoleResponse>>() {
+                                                                                         });
+                                                                         return Uni.createFrom().item(
+                                                                                         ApiResponse.success("Roles found", cachedRoles));
+                                                                 }
 
-                                                                 span.setAttribute("roles.count", responses.size());
+                                                                 logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                                                 return redisService.setReactive(cacheKey, toJson(responses))
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached roles for key: {}", cacheKey);
-                                                                                         span.setStatus(StatusCode.OK);
+                                                                 return roleRepository.findUserRoles(userId)
+                                                                                 .chain(roles -> {
+                                                                                         List<RoleResponse> responses = roles.stream()
+                                                                                                         .map(RoleResponse::from)
+                                                                                                         .collect(Collectors.toList());
 
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_role_by_user_id",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-
-                                                                                         return ApiResponse.success("Roles found", responses);
+                                                                                         return redisService.setReactive(cacheKey,
+                                                                                                         toJson(responses))
+                                                                                                         .map(v -> {
+                                                                                                                 logger.info("Cached roles for key: {}",
+                                                                                                                                 cacheKey);
+                                                                                                                 return ApiResponse.success(
+                                                                                                                                 "Roles found",
+                                                                                                                                 responses);
+                                                                                                         });
                                                                                  });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding roles by user id: {}", userId, e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_role_by_user_id",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_role_by_user_id"));
-                                                                 logger.debug("Find roles by user id operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                        });
+                                }).onFailure().invoke(e -> {
+                                        logger.error("Error finding roles by user id: {}", userId, e);
+                                });
         }
 
         private <T, R> ApiResponsePagination<List<R>> buildPaginatedResponse(
@@ -463,73 +352,54 @@ public class RoleQueryServiceImpl implements RoleQueryService {
         public Uni<ApiResponse<RoleResponse>> findByName(String name) {
                 String cacheKey = "role:name:" + name;
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                        if (cachedJson != null) {
-                                                logger.info("Cache HIT for key: {}", cacheKey);
-                                                RoleResponse cachedRole = fromJson(cachedJson, RoleResponse.class);
-                                                return Uni.createFrom().item(ApiResponse.success("Role found", cachedRole));
-                                        }
+                Attributes attrs = Attributes.builder()
+                                .put("operation", "find_role_by_name")
+                                .put("service.name", "role-service")
+                                .put("role.name", name)
+                                .build();
 
-                                        logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                        long startTime = System.currentTimeMillis();
-                                        Span span = tracer.spanBuilder("findRoleByName")
-                                                        .setSpanKind(SpanKind.SERVER)
-                                                        .setAttribute("service.name", "role-service")
-                                                        .setAttribute("operation", "find_role_by_name")
-                                                        .setAttribute("role.name", name)
-                                                        .startSpan();
+                return tracingMetrics.<ApiResponse<RoleResponse>>traceAndMeasure(
+                                "findRoleByName", "find_role_by_name", attrs, () -> {
 
-                                        return roleRepository.findByRoleName(name)
-                                                        .chain(role -> {
-                                                                if (role == null) {
-                                                                        logger.warn("Role not found with name: {}", name);
-                                                                        span.setStatus(StatusCode.ERROR, "Role not found");
-                                                                        span.setAttribute("role.found", false);
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                 if (cachedJson != null) {
+                                                                         logger.info("Cache HIT for key: {}", cacheKey);
+                                                                         RoleResponse cachedRole = fromJson(cachedJson,
+                                                                                         RoleResponse.class);
+                                                                         return Uni.createFrom()
+                                                                                         .item(ApiResponse.success("Role found", cachedRole));
+                                                                 }
 
-                                                                        requestsTotal.add(1, Attributes.of(
-                                                                                        AttributeKey.stringKey("operation"), "find_role_by_name",
-                                                                                        AttributeKey.stringKey("status"), "failed",
-                                                                                        AttributeKey.stringKey("error_type"), "not_found"));
+                                                                 logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                                                        throw new NotFoundException("Role not found with name: " + name);
-                                                                }
+                                                                 return roleRepository.findByRoleName(name)
+                                                                                 .chain(role -> {
+                                                                                         if (role == null) {
+                                                                                                 logger.warn("Role not found with name: {}",
+                                                                                                                 name);
+                                                                                                 throw new NotFoundException(
+                                                                                                                 "Role not found with name: " + name);
+                                                                                         }
 
-                                                                span.setAttribute("role.found", true);
-                                                                span.setAttribute("role.name", role.getRoleName());
+                                                                                         RoleResponse roleResponse = RoleResponse
+                                                                                                         .from(role);
 
-                                                                RoleResponse roleResponse = RoleResponse.from(role);
-
-                                                                return redisService.setReactive(cacheKey, toJson(roleResponse))
-                                                                                .map(v -> {
-                                                                                        logger.info("Cached role for key: {}", cacheKey);
-                                                                                        logger.info("Successfully found role with name: {}", role.getRoleName());
-                                                                                        span.setStatus(StatusCode.OK);
-
-                                                                                        requestsTotal.add(1, Attributes.of(
-                                                                                                        AttributeKey.stringKey("operation"), "find_role_by_name",
-                                                                                                        AttributeKey.stringKey("status"), "success"));
-
-                                                                                        return ApiResponse.success("Role found", roleResponse);
-                                                                                });
-                                                        })
-                                                        .onFailure().invoke(e -> {
-                                                                logger.error("Error finding role by name: {}", name, e);
-                                                                span.recordException(e);
-                                                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                requestsTotal.add(1, Attributes.of(
-                                                                                AttributeKey.stringKey("operation"), "find_role_by_name",
-                                                                                AttributeKey.stringKey("status"), "failed",
-                                                                                AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                        })
-                                                        .eventually(() -> {
-                                                                span.end();
-                                                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                requestDurationSeconds.record(duration, Attributes.of(
-                                                                                AttributeKey.stringKey("operation"), "find_role_by_name"));
-                                                                logger.debug("Find role by name operation completed in {} seconds", duration);
+                                                                                         return redisService.setReactive(cacheKey,
+                                                                                                         toJson(roleResponse))
+                                                                                                         .map(v -> {
+                                                                                                                 logger.info("Cached role for key: {}",
+                                                                                                                                 cacheKey);
+                                                                                                                 logger.info("Successfully found role with name: {}",
+                                                                                                                                 role.getRoleName());
+                                                                                                                 return ApiResponse.success(
+                                                                                                                                 "Role found",
+                                                                                                                                 roleResponse);
+                                                                                                         });
+                                                                                 });
                                                         });
+                                }).onFailure().invoke(e -> {
+                                        logger.error("Error finding role by name: {}", name, e);
                                 });
         }
 }

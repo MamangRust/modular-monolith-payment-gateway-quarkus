@@ -16,6 +16,7 @@ import com.sanedge.withdraw.domain.response.WithdrawResponseDeleteAt;
 import com.sanedge.withdraw.entity.Withdraw;
 import com.sanedge.common.enums.Status;
 import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.common.observability.TracingMetrics;
 import pb.card.CardQueryService;
 import pb.saldo.SaldoQueryService;
 import pb.saldo.SaldoCommandService;
@@ -27,16 +28,7 @@ import com.sanedge.withdraw.repository.WithdrawCommandRepository;
 import com.sanedge.withdraw.repository.WithdrawQueryRepository;
 import com.sanedge.withdraw.service.WithdrawCommandService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -57,10 +49,7 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
     private final Validator validator;
     private final RedisService redisService;
     private final KafkaService kafkaService;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     @Inject
     public WithdrawCommandServiceImpl(WithdrawQueryRepository withdrawQueryRepository,
@@ -71,7 +60,7 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
                                       Validator validator,
                                       RedisService redisService,
                                       KafkaService kafkaService,
-                                      OpenTelemetry openTelemetry) {
+                                      TracingMetrics tracingMetrics) {
         this.withdrawQueryRepository = withdrawQueryRepository;
         this.withdrawCommandRepository = withdrawCommandRepository;
         this.cardQueryService = cardQueryService;
@@ -80,16 +69,7 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
         this.validator = validator;
         this.redisService = redisService;
         this.kafkaService = kafkaService;
-        this.tracer = openTelemetry.getTracer("withdraw-command-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("withdraw-command-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     private <T> void validateRequest(T req) {
@@ -119,237 +99,181 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
     @Override
     @WithTransaction
     public Uni<ApiResponse<WithdrawResponse>> create(CreateWithdrawRequest req) {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("createWithdraw")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "withdraw-command-service")
-                .setAttribute("operation", "create")
-                .setAttribute("cardNumber", req.getCardNumber())
-                .startSpan();
-
         logger.info("🚀 Starting create withdraw request: {}", req);
 
         try {
             validateRequest(req);
         } catch (Exception e) {
-            span.setStatus(StatusCode.ERROR, e.getMessage());
-            span.end();
             return Uni.createFrom().item(new ApiResponse<>("error", "Validation failed: " + e.getMessage(), null));
         }
 
         if (req.getWithdrawAmount() == null || req.getWithdrawAmount() <= 0) {
-            span.setStatus(StatusCode.ERROR, "withdraw_amount must be > 0");
-            span.end();
             return Uni.createFrom().item(new ApiResponse<>("error", "withdraw_amount must be > 0", null));
         }
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "create")
+                .put("cardNumber", req.getCardNumber())
+                .build();
+
         final String[] senderEmailContainer = new String[1];
-        return cardQueryService.findUserCardByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(req.getCardNumber()).build())
-                .chain(cardResponse -> {
-                    if (cardResponse == null || cardResponse.getCardNumber() == null || cardResponse.getCardNumber().isEmpty()) {
-                        logger.error("❌ Card not found with number={}", req.getCardNumber());
-                        throw new ResourceNotFoundException("Card not found");
-                    }
-                    senderEmailContainer[0] = cardResponse.getEmail();
-                    return saldoQueryService.findByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(req.getCardNumber()).build());
-                })
-                .chain(saldoResponse -> {
-                    if (saldoResponse == null || !saldoResponse.hasData()) {
-                        logger.error("❌ Saldo not found for card number={}", req.getCardNumber());
-                        throw new ResourceNotFoundException("Saldo not found");
-                    }
-                    pb.saldo.Saldo.SaldoResponse saldo = saldoResponse.getData();
+        return tracingMetrics.traceAndMeasure("createWithdraw", "create", attrs, () ->
+                cardQueryService.findUserCardByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(req.getCardNumber()).build())
+                        .chain(cardResponse -> {
+                            if (cardResponse == null || cardResponse.getCardNumber() == null || cardResponse.getCardNumber().isEmpty()) {
+                                logger.error("❌ Card not found with number={}", req.getCardNumber());
+                                throw new ResourceNotFoundException("Card not found");
+                            }
+                            senderEmailContainer[0] = cardResponse.getEmail();
+                            return saldoQueryService.findByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(req.getCardNumber()).build());
+                        })
+                        .chain(saldoResponse -> {
+                            if (saldoResponse == null || !saldoResponse.hasData()) {
+                                logger.error("❌ Saldo not found for card number={}", req.getCardNumber());
+                                throw new ResourceNotFoundException("Saldo not found");
+                            }
+                            pb.saldo.Saldo.SaldoResponse saldo = saldoResponse.getData();
 
-                    if (saldo.getTotalBalance() < req.getWithdrawAmount()) {
-                        logger.error("❌ Insufficient balance for card number={}. Balance={}, Requested={}",
-                                req.getCardNumber(), saldo.getTotalBalance(), req.getWithdrawAmount());
-                        throw new IllegalStateException("Insufficient balance");
-                    }
+                            if (saldo.getTotalBalance() < req.getWithdrawAmount()) {
+                                logger.error("❌ Insufficient balance for card number={}. Balance={}, Requested={}",
+                                        req.getCardNumber(), saldo.getTotalBalance(), req.getWithdrawAmount());
+                                throw new IllegalStateException("Insufficient balance");
+                            }
 
-                    int newBalance = saldo.getTotalBalance() - req.getWithdrawAmount().intValue();
+                            int newBalance = saldo.getTotalBalance() - req.getWithdrawAmount().intValue();
 
-                    Withdraw withdraw = new Withdraw();
-                    withdraw.setCardNumber(req.getCardNumber());
-                    withdraw.setWithdrawNo(UUID.randomUUID());
-                    withdraw.setStatus(Status.PENDING);
-                    withdraw.setWithdrawTime(req.getWithdrawTime() != null ?
-                            java.sql.Timestamp.valueOf(req.getWithdrawTime()) :
-                            java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
-                    withdraw.setWithdrawAmount(req.getWithdrawAmount().intValue());
-                    withdraw.setCreatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
-                    withdraw.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                            Withdraw withdraw = new Withdraw();
+                            withdraw.setCardNumber(req.getCardNumber());
+                            withdraw.setWithdrawNo(UUID.randomUUID());
+                            withdraw.setStatus(Status.PENDING);
+                            withdraw.setWithdrawTime(req.getWithdrawTime() != null ?
+                                    java.sql.Timestamp.valueOf(req.getWithdrawTime()) :
+                                    java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                            withdraw.setWithdrawAmount(req.getWithdrawAmount().intValue());
+                            withdraw.setCreatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                            withdraw.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
 
-                    return saldoCommandService.updateSaldoWithdraw(pb.saldo.SaldoCommand.UpdateSaldoWithdrawRequest.newBuilder()
-                                    .setCardNumber(saldo.getCardNumber())
-                                    .setTotalBalance(newBalance)
-                                    .setWithdrawTime(withdraw.getWithdrawTime().toString())
-                                    .setWithdrawAmount(req.getWithdrawAmount().intValue())
-                                    .build())
-                            .chain(v -> withdrawCommandRepository.persist(withdraw))
-                            .chain(savedWithdraw -> withdrawCommandRepository.updateStatus(savedWithdraw.getWithdrawId(), Status.SUCCESS.toString()))
-                            .chain(updatedWithdraw -> {
-                                logger.info("✅ Withdraw created successfully with ID={}", updatedWithdraw.getWithdrawId());
-                                return evictCaches(req.getCardNumber(), updatedWithdraw.getWithdrawId())
-                                        .chain(v -> {
-                                            Uni<Void> emailUni = Uni.createFrom().voidItem();
-                                            String email = senderEmailContainer[0];
-                                            if (email != null && !email.isEmpty()) {
-                                                String emailSubject = "Withdraw Successful - SanEdge";
-                                                String emailBody = String.format(
-                                                        "Hello,\n\nYour withdraw of %d has been processed successfully.\n\nRegards,\nSupport Team",
-                                                        req.getWithdrawAmount().intValue()
-                                                );
+                            return saldoCommandService.updateSaldoWithdraw(pb.saldo.SaldoCommand.UpdateSaldoWithdrawRequest.newBuilder()
+                                            .setCardNumber(saldo.getCardNumber())
+                                            .setTotalBalance(newBalance)
+                                            .setWithdrawTime(withdraw.getWithdrawTime().toString())
+                                            .setWithdrawAmount(req.getWithdrawAmount().intValue())
+                                            .build())
+                                    .chain(v -> withdrawCommandRepository.persist(withdraw))
+                                    .chain(savedWithdraw -> withdrawCommandRepository.updateStatus(savedWithdraw.getWithdrawId(), Status.SUCCESS.toString()))
+                                    .chain(updatedWithdraw -> {
+                                        logger.info("✅ Withdraw created successfully with ID={}", updatedWithdraw.getWithdrawId());
+                                        return evictCaches(req.getCardNumber(), updatedWithdraw.getWithdrawId())
+                                                .chain(v -> {
+                                                    Uni<Void> emailUni = Uni.createFrom().voidItem();
+                                                    String email = senderEmailContainer[0];
+                                                    if (email != null && !email.isEmpty()) {
+                                                        String emailSubject = "Withdraw Successful - SanEdge";
+                                                        String emailBody = String.format(
+                                                                "Hello,\n\nYour withdraw of %d has been processed successfully.\n\nRegards,\nSupport Team",
+                                                                req.getWithdrawAmount().intValue()
+                                                        );
 
-                                                JsonObject emailPayload = new JsonObject()
-                                                        .put("email", email)
-                                                        .put("subject", emailSubject)
-                                                        .put("body", emailBody);
+                                                        JsonObject emailPayload = new JsonObject()
+                                                                .put("email", email)
+                                                                .put("subject", emailSubject)
+                                                                .put("body", emailBody);
 
-                                                emailUni = kafkaService.sendMessage("email-service-topic-withdraw-create", String.valueOf(updatedWithdraw.getWithdrawId()), emailPayload)
-                                                        .onFailure().recoverWithNull();
-                                            }
+                                                        emailUni = kafkaService.sendMessage("email-service-topic-withdraw-create", String.valueOf(updatedWithdraw.getWithdrawId()), emailPayload)
+                                                                .onFailure().recoverWithNull();
+                                                    }
 
-                                            return emailUni.map(v3 -> {
-                                                span.setStatus(StatusCode.OK);
-                                                requestsTotal.add(1, Attributes.of(
-                                                        AttributeKey.stringKey("operation"), "create",
-                                                        AttributeKey.stringKey("status"), "success"));
-
-                                                return ApiResponse.success("Created withdraw successfully", WithdrawResponse.from(updatedWithdraw));
-                                            });
-                                        });
-                            });
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Error creating withdraw", e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "create",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", "Failed to create withdraw: " + e.getMessage(), null);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "create"));
-                });
+                                                    return emailUni.map(v3 -> ApiResponse.success("Created withdraw successfully", WithdrawResponse.from(updatedWithdraw)));
+                                                });
+                                    });
+                        })
+                        .onFailure().recoverWithItem(e -> {
+                            logger.error("💥 Error creating withdraw", e);
+                            return new ApiResponse<>("error", "Failed to create withdraw: " + e.getMessage(), null);
+                        }));
     }
 
     @Override
     @WithTransaction
     public Uni<ApiResponse<WithdrawResponse>> update(UpdateWithdrawRequest req) {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("updateWithdraw")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "withdraw-command-service")
-                .setAttribute("operation", "update")
-                .setAttribute("withdrawId", String.valueOf(req.getWithdrawId()))
-                .startSpan();
-
         logger.info("🚀 Starting update withdraw request: {}", req);
 
         try {
             validateRequest(req);
         } catch (Exception e) {
-            span.setStatus(StatusCode.ERROR, e.getMessage());
-            span.end();
             return Uni.createFrom().item(new ApiResponse<>("error", "Validation failed: " + e.getMessage(), null));
         }
 
         if (req.getWithdrawId() == null) {
-            span.setStatus(StatusCode.ERROR, "withdraw_id is required");
-            span.end();
             return Uni.createFrom().item(new ApiResponse<>("error", "withdraw_id is required", null));
         }
 
         if (req.getWithdrawAmount() == null || req.getWithdrawAmount() <= 0) {
-            span.setStatus(StatusCode.ERROR, "withdraw_amount must be > 0");
-            span.end();
             return Uni.createFrom().item(new ApiResponse<>("error", "withdraw_amount must be > 0", null));
         }
 
-        return cardQueryService.findByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(req.getCardNumber()).build())
-                .chain(cardResponse -> {
-                    if (cardResponse == null || !cardResponse.hasData()) {
-                        logger.error("❌ Card not found with number={}", req.getCardNumber());
-                        throw new ResourceNotFoundException("Card not found");
-                    }
-                    return withdrawQueryRepository.findById(req.getWithdrawId());
-                })
-                .chain(withdraw -> {
-                    if (withdraw == null) {
-                        logger.error("❌ Withdraw not found with ID={}", req.getWithdrawId());
-                        throw new ResourceNotFoundException("Withdraw not found");
-                    }
-                    return saldoQueryService.findByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(req.getCardNumber()).build())
-                            .chain(saldoResponse -> {
-                                if (saldoResponse == null || !saldoResponse.hasData()) {
-                                    logger.error("❌ Saldo not found for card number={}", req.getCardNumber());
-                                    throw new ResourceNotFoundException("Saldo not found");
-                                }
-                                pb.saldo.Saldo.SaldoResponse saldo = saldoResponse.getData();
+        Attributes attrs = Attributes.builder()
+                .put("operation", "update")
+                .put("withdrawId", String.valueOf(req.getWithdrawId()))
+                .build();
 
-                                long amountDifference = req.getWithdrawAmount() - withdraw.getWithdrawAmount();
-                                if (saldo.getTotalBalance() < amountDifference) {
-                                    logger.error("❌ Insufficient balance for update. Balance={}, Needed={}",
-                                            saldo.getTotalBalance(), amountDifference);
-                                    throw new IllegalStateException("Insufficient balance");
-                                }
+        return tracingMetrics.traceAndMeasure("updateWithdraw", "update", attrs, () ->
+                cardQueryService.findByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(req.getCardNumber()).build())
+                        .chain(cardResponse -> {
+                            if (cardResponse == null || !cardResponse.hasData()) {
+                                logger.error("❌ Card not found with number={}", req.getCardNumber());
+                                throw new ResourceNotFoundException("Card not found");
+                            }
+                            return withdrawQueryRepository.findById(req.getWithdrawId());
+                        })
+                        .chain(withdraw -> {
+                            if (withdraw == null) {
+                                logger.error("❌ Withdraw not found with ID={}", req.getWithdrawId());
+                                throw new ResourceNotFoundException("Withdraw not found");
+                            }
+                            return saldoQueryService.findByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(req.getCardNumber()).build())
+                                    .chain(saldoResponse -> {
+                                        if (saldoResponse == null || !saldoResponse.hasData()) {
+                                            logger.error("❌ Saldo not found for card number={}", req.getCardNumber());
+                                            throw new ResourceNotFoundException("Saldo not found");
+                                        }
+                                        pb.saldo.Saldo.SaldoResponse saldo = saldoResponse.getData();
 
-                                int newBalance = saldo.getTotalBalance() - (int) amountDifference;
+                                        long amountDifference = req.getWithdrawAmount() - withdraw.getWithdrawAmount();
+                                        if (saldo.getTotalBalance() < amountDifference) {
+                                            logger.error("❌ Insufficient balance for update. Balance={}, Needed={}",
+                                                    saldo.getTotalBalance(), amountDifference);
+                                            throw new IllegalStateException("Insufficient balance");
+                                        }
 
-                                withdraw.setCardNumber(req.getCardNumber());
-                                withdraw.setWithdrawAmount(req.getWithdrawAmount().intValue());
-                                withdraw.setWithdrawTime(req.getWithdrawTime() != null ?
-                                        java.sql.Timestamp.valueOf(req.getWithdrawTime()) :
-                                        java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
-                                withdraw.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                                        int newBalance = saldo.getTotalBalance() - (int) amountDifference;
 
-                                return saldoCommandService.updateSaldoWithdraw(pb.saldo.SaldoCommand.UpdateSaldoWithdrawRequest.newBuilder()
-                                                .setCardNumber(saldo.getCardNumber())
-                                                .setTotalBalance(newBalance)
-                                                .setWithdrawTime(withdraw.getWithdrawTime().toString())
-                                                .setWithdrawAmount(req.getWithdrawAmount().intValue())
-                                                .build())
-                                        .chain(v -> withdrawCommandRepository.persist(withdraw))
-                                        .chain(savedWithdraw -> withdrawCommandRepository.updateStatus(savedWithdraw.getWithdrawId(), Status.SUCCESS.toString()))
-                                        .chain(updatedWithdraw -> {
-                                            logger.info("✅ Withdraw updated successfully with ID={}", updatedWithdraw.getWithdrawId());
-                                            return evictCaches(req.getCardNumber(), updatedWithdraw.getWithdrawId())
-                                                    .map(v -> {
-                                                        span.setStatus(StatusCode.OK);
-                                                        requestsTotal.add(1, Attributes.of(
-                                                                AttributeKey.stringKey("operation"), "update",
-                                                                AttributeKey.stringKey("status"), "success"));
+                                        withdraw.setCardNumber(req.getCardNumber());
+                                        withdraw.setWithdrawAmount(req.getWithdrawAmount().intValue());
+                                        withdraw.setWithdrawTime(req.getWithdrawTime() != null ?
+                                                java.sql.Timestamp.valueOf(req.getWithdrawTime()) :
+                                                java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                                        withdraw.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
 
-                                                        return ApiResponse.success("Updated withdraw successfully", WithdrawResponse.from(updatedWithdraw));
-                                                    });
-                                        });
-                            });
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Error updating withdraw", e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "update",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", "Failed to update withdraw: " + e.getMessage(), null);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "update"));
-                });
+                                        return saldoCommandService.updateSaldoWithdraw(pb.saldo.SaldoCommand.UpdateSaldoWithdrawRequest.newBuilder()
+                                                        .setCardNumber(saldo.getCardNumber())
+                                                        .setTotalBalance(newBalance)
+                                                        .setWithdrawTime(withdraw.getWithdrawTime().toString())
+                                                        .setWithdrawAmount(req.getWithdrawAmount().intValue())
+                                                        .build())
+                                                .chain(v -> withdrawCommandRepository.persist(withdraw))
+                                                .chain(savedWithdraw -> withdrawCommandRepository.updateStatus(savedWithdraw.getWithdrawId(), Status.SUCCESS.toString()))
+                                                .chain(updatedWithdraw -> {
+                                                    logger.info("✅ Withdraw updated successfully with ID={}", updatedWithdraw.getWithdrawId());
+                                                    return evictCaches(req.getCardNumber(), updatedWithdraw.getWithdrawId())
+                                                            .map(v -> ApiResponse.success("Updated withdraw successfully", WithdrawResponse.from(updatedWithdraw)));
+                                                });
+                                    });
+                        })
+                        .onFailure().recoverWithItem(e -> {
+                            logger.error("💥 Error updating withdraw", e);
+                            return new ApiResponse<>("error", "Failed to update withdraw: " + e.getMessage(), null);
+                        }));
     }
 
     @Override

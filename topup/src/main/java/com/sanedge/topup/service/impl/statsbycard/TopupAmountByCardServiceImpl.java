@@ -18,6 +18,7 @@ import com.sanedge.topup.domain.response.stats.amount.TopupYearlyAmountResponse;
 import com.sanedge.topup.repository.statsbycard.TopupAmountByCardRepository;
 import com.sanedge.topup.service.stats.amount.TopupAmountByCardService;
 
+import com.sanedge.common.observability.TracingMetrics;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
@@ -46,7 +47,14 @@ public class TopupAmountByCardServiceImpl implements TopupAmountByCardService {
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
-    @Inject
+        public TopupAmountByCardServiceImpl(TopupAmountByCardRepository topupAmountByCardRepository,
+            RedisService redisService,
+            ObjectMapper objectMapper,
+            TracingMetrics tracingMetrics) {
+        this(topupAmountByCardRepository, redisService, objectMapper, OpenTelemetry.noop());
+    }
+
+@Inject
     public TopupAmountByCardServiceImpl(TopupAmountByCardRepository topupAmountByCardRepository,
                                         RedisService redisService,
                                         ObjectMapper objectMapper,

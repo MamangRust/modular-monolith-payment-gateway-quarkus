@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.common.config.RedisService;
 import com.sanedge.transaction.domain.requests.stats.MonthStatusTransaction;
 import com.sanedge.common.domain.response.ApiResponse;
@@ -49,7 +50,14 @@ public class TransactionStatusImplService implements TransactionStatusService {
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
-    @Inject
+        public TransactionStatusImplService(TransactionStatusRepository transactionStatusRepository,
+            RedisService redisService,
+            ObjectMapper objectMapper,
+            TracingMetrics tracingMetrics) {
+        this(transactionStatusRepository, redisService, objectMapper, OpenTelemetry.noop());
+    }
+
+@Inject
     public TransactionStatusImplService(TransactionStatusRepository transactionStatusRepository,
                                         RedisService redisService,
                                         ObjectMapper objectMapper,

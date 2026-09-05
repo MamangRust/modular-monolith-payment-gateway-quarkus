@@ -1,14 +1,74 @@
 package com.sanedge.saldo.repository;
 
 import com.sanedge.saldo.entity.Saldo;
+import com.sanedge.saldo.entity.SaldoMutationOperation;
 
 import io.quarkus.hibernate.reactive.panache.PanacheRepository;
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 
 @ApplicationScoped
 public class SaldoCommandRepository implements PanacheRepository<Saldo> {
+
+    @Inject
+    SaldoMutationOperationRepository saldoMutationOperationRepository;
+
+    @WithTransaction
+    public Uni<Integer> updateBalanceByDelta(String cardNumber, long delta, long minimumBalance, String operationKey) {
+        java.sql.Timestamp now = java.sql.Timestamp.valueOf(java.time.LocalDateTime.now());
+
+        return saldoMutationOperationRepository.findByOperationKey(operationKey)
+                .chain(existing -> {
+                    // Exactly-once: an already APPLIED operation is never re-applied.
+                    if (existing != null && "APPLIED".equals(existing.getResultStatus())) {
+                        return Uni.createFrom().item(1);
+                    }
+
+                    return find("cardNumber = ?1 AND deletedAt IS NULL", cardNumber).firstResult()
+                            .chain(saldo -> {
+                                if (saldo == null) {
+                                    return Uni.createFrom().item(0);
+                                }
+
+                                long currentBalance = saldo.getTotalBalance() != null ? saldo.getTotalBalance() : 0L;
+                                long newBalance = currentBalance + delta;
+
+                                if (newBalance < minimumBalance) {
+                                    SaldoMutationOperation op = existing != null ? existing : new SaldoMutationOperation();
+                                    op.setOperationKey(operationKey);
+                                    op.setCardNumber(cardNumber);
+                                    op.setRequestedDelta((int) delta);
+                                    op.setMinimumBalance((int) minimumBalance);
+                                    op.setResultStatus("REJECTED");
+                                    op.setResultBalance((int) currentBalance);
+                                    op.setFailureReason("Insufficient balance");
+                                    op.setCreatedAt(now);
+                                    op.setUpdatedAt(now);
+                                    return saldoMutationOperationRepository.persist(op).map(v -> 0);
+                                }
+
+                                saldo.setTotalBalance((int) newBalance);
+                                saldo.setUpdatedAt(now);
+
+                                return persist(saldo)
+                                        .chain(s -> {
+                                            SaldoMutationOperation op = existing != null ? existing : new SaldoMutationOperation();
+                                            op.setOperationKey(operationKey);
+                                            op.setCardNumber(cardNumber);
+                                            op.setRequestedDelta((int) delta);
+                                            op.setMinimumBalance((int) minimumBalance);
+                                            op.setResultStatus("APPLIED");
+                                            op.setResultBalance((int) newBalance);
+                                            op.setFailureReason(null);
+                                            op.setCreatedAt(now);
+                                            op.setUpdatedAt(now);
+                                            return saldoMutationOperationRepository.persist(op).map(v -> 1);
+                                        });
+                            });
+                });
+    }
 
     @WithTransaction
     public Uni<Saldo> trashed(Long saldoId) {

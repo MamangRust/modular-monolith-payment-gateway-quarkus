@@ -3,6 +3,8 @@ package com.sanedge.topup.repository;
 import java.util.List;
 
 import com.sanedge.common.domain.response.PagedResult;
+import com.sanedge.topup.domain.requests.FindAllTopups;
+import com.sanedge.topup.domain.requests.FindAllTopupsByCardNumber;
 import com.sanedge.topup.entity.Topup;
 
 import io.quarkus.hibernate.reactive.panache.PanacheRepository;
@@ -13,7 +15,10 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class TopupQueryRepository implements PanacheRepository<Topup> {
 
-    public Uni<PagedResult<Topup>> findTopups(String search, int page, int size) {
+    public Uni<PagedResult<Topup>> findTopups(FindAllTopups req) {
+        String search = req.getSearch();
+        int page = (req.getPage() != null && req.getPage() > 0) ? req.getPage() - 1 : 0;
+        int size = (req.getPageSize() != null && req.getPageSize() > 0) ? req.getPageSize() : 10;
         var query = """
                     deletedAt IS NULL
                     AND (
@@ -33,7 +38,11 @@ public class TopupQueryRepository implements PanacheRepository<Topup> {
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
     }
 
-    public Uni<PagedResult<Topup>> findTopupByCard(String cardNumber, String search, int page, int size) {
+    public Uni<PagedResult<Topup>> findTopupByCard(FindAllTopupsByCardNumber req) {
+        String cardNumber = req.getCardNumber();
+        String search = req.getSearch();
+        int page = (req.getPage() != null && req.getPage() > 0) ? req.getPage() - 1 : 0;
+        int size = (req.getPageSize() != null && req.getPageSize() > 0) ? req.getPageSize() : 10;
         var query = """
                     deletedAt IS NULL
                     AND cardNumber = ?1
@@ -53,11 +62,14 @@ public class TopupQueryRepository implements PanacheRepository<Topup> {
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
     }
 
-    public Uni<PagedResult<Topup>> findActiveTopups(String search, int page, int size) {
-        return findTopups(search, page, size);
+    public Uni<PagedResult<Topup>> findActiveTopups(FindAllTopups req) {
+        return findTopups(req);
     }
 
-    public Uni<PagedResult<Topup>> findTrashedTopups(String search, int page, int size) {
+    public Uni<PagedResult<Topup>> findTrashedTopups(FindAllTopups req) {
+        String search = req.getSearch();
+        int page = (req.getPage() != null && req.getPage() > 0) ? req.getPage() - 1 : 0;
+        int size = (req.getPageSize() != null && req.getPageSize() > 0) ? req.getPageSize() : 10;
         var query = """
                     deletedAt IS NOT NULL
                     AND (
@@ -83,5 +95,9 @@ public class TopupQueryRepository implements PanacheRepository<Topup> {
 
     public Uni<Topup> findTopupById(Long id) {
         return find("topupId = ?1 AND deletedAt IS NULL", id).firstResult();
+    }
+
+    public Uni<List<Topup>> findPendingCompensation(int maxAttempts) {
+        return find("compensationAttempts < ?1 AND deletedAt IS NULL", maxAttempts).list();
     }
 }

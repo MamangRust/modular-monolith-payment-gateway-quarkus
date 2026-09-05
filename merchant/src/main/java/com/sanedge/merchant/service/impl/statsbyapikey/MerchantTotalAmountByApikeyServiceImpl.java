@@ -11,6 +11,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sanedge.common.config.RedisService;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.merchant.domain.requests.statsbyapikey.MonthYearTotalAmountApiKey;
 import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.merchant.domain.response.stats.total_amount.MerchantResponseMonthlyTotalAmount;
@@ -18,16 +19,7 @@ import com.sanedge.merchant.domain.response.stats.total_amount.MerchantResponseY
 import com.sanedge.merchant.repository.statsbyapikey.MerchantTotalAmountByApiKeyRepository;
 import com.sanedge.merchant.service.stats.totalamount.MerchantTotalAmountByApiKeyService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -39,31 +31,19 @@ public class MerchantTotalAmountByApikeyServiceImpl implements MerchantTotalAmou
     private final MerchantTotalAmountByApiKeyRepository merchantTotalAmountByApiKeyRepository;
     private final RedisService redisService;
     private final ObjectMapper objectMapper;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
     @Inject
     public MerchantTotalAmountByApikeyServiceImpl(MerchantTotalAmountByApiKeyRepository merchantTotalAmountByApiKeyRepository,
-                                                 OpenTelemetry openTelemetry,
                                                  RedisService redisService,
-                                                 ObjectMapper objectMapper) {
+                                                 ObjectMapper objectMapper,
+                                                 TracingMetrics tracingMetrics) {
         this.merchantTotalAmountByApiKeyRepository = merchantTotalAmountByApiKeyRepository;
         this.redisService = redisService;
         this.objectMapper = objectMapper;
-        this.tracer = openTelemetry.getTracer("merchant-total-amount-by-apikey-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("merchant-total-amount-by-apikey-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     private String toJson(Object obj) {
@@ -104,66 +84,46 @@ public class MerchantTotalAmountByApikeyServiceImpl implements MerchantTotalAmou
 
         String cacheKey = String.format("merchant-stats-apikey:total-amount:monthly:%s:%d", apiKey, year);
 
-        return redisService.getReactive(cacheKey)
-                .chain(cachedJson -> {
-                    if (cachedJson != null) {
-                        logger.info("Cache HIT for key: {}", cacheKey);
-                        ApiResponse<List<MerchantResponseMonthlyTotalAmount>> response = fromJson(cachedJson,
-                                new TypeReference<ApiResponse<List<MerchantResponseMonthlyTotalAmount>>>() {
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_month_total_amount_by_apikey")
+                .put("service.name", "merchant-total-amount-by-apikey-service")
+                .put("year", String.valueOf(year))
+                .build();
+
+        return tracingMetrics.traceAndMeasure("findMonthTotalAmountByApiKey", "find_month_total_amount_by_apikey", attrs, () -> {
+            return redisService.getReactive(cacheKey)
+                    .chain(cachedJson -> {
+                        if (cachedJson != null) {
+                            logger.info("Cache HIT for key: {}", cacheKey);
+                            ApiResponse<List<MerchantResponseMonthlyTotalAmount>> response = fromJson(cachedJson,
+                                    new TypeReference<ApiResponse<List<MerchantResponseMonthlyTotalAmount>>>() {});
+                            return Uni.createFrom().item(response);
+                        }
+
+                        logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
+
+                        LocalDate yearDate = LocalDate.of(year.intValue(), 1, 1);
+
+                        return merchantTotalAmountByApiKeyRepository.findMonthlyTotalAmountByApiKey(apiKey, yearDate)
+                                .chain(monthlyTotals -> {
+                                    List<MerchantResponseMonthlyTotalAmount> responseList = monthlyTotals.stream()
+                                            .map(MerchantResponseMonthlyTotalAmount::from)
+                                            .collect(Collectors.toList());
+
+                                    ApiResponse<List<MerchantResponseMonthlyTotalAmount>> response = ApiResponse.success(
+                                            "Successfully fetched monthly total merchant amounts for year=" + year,
+                                            responseList);
+
+                                    return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                            .map(v -> {
+                                                logger.info("Cached monthly total merchant amounts by apiKey for year: {}", year);
+                                                return response;
+                                            });
                                 });
-                        return Uni.createFrom().item(response);
-                    }
-
-                    logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findMonthTotalAmountByApiKey")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "merchant-total-amount-by-apikey-service")
-                            .setAttribute("operation", "find_month_total_amount_by_apikey")
-                            .setAttribute("year", year.toString())
-                            .startSpan();
-
-                    LocalDate yearDate = LocalDate.of(year.intValue(), 1, 1);
-
-                    return merchantTotalAmountByApiKeyRepository.findMonthlyTotalAmountByApiKey(apiKey, yearDate)
-                            .chain(monthlyTotals -> {
-                                List<MerchantResponseMonthlyTotalAmount> responseList = monthlyTotals.stream()
-                                        .map(MerchantResponseMonthlyTotalAmount::from)
-                                        .collect(Collectors.toList());
-
-                                ApiResponse<List<MerchantResponseMonthlyTotalAmount>> response = ApiResponse.success(
-                                        "Successfully fetched monthly total merchant amounts for year=" + year,
-                                        responseList
-                                );
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            logger.info("Cached monthly total merchant amounts by apiKey for year: {}", year);
-                                            span.setStatus(StatusCode.OK);
-
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_month_total_amount_by_apikey",
-                                                    AttributeKey.stringKey("status"), "success"));
-                                            return response;
-                                        });
-                            })
-                            .onFailure().invoke(e -> {
-                                logger.error("❌ Failed to fetch monthly total merchant amounts for year={} apiKey={}", year, apiKey, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_total_amount_by_apikey",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_total_amount_by_apikey"));
-                            });
-                });
+                    });
+        }).onFailure().invoke(e -> {
+            logger.error("❌ Failed to fetch monthly total merchant amounts for year={} apiKey={}", year, apiKey, e);
+        });
     }
 
     @Override
@@ -179,65 +139,45 @@ public class MerchantTotalAmountByApikeyServiceImpl implements MerchantTotalAmou
 
         String cacheKey = String.format("merchant-stats-apikey:total-amount:yearly:%s:%d", apiKey, year);
 
-        return redisService.getReactive(cacheKey)
-                .chain(cachedJson -> {
-                    if (cachedJson != null) {
-                        logger.info("Cache HIT for key: {}", cacheKey);
-                        ApiResponse<List<MerchantResponseYearlyTotalAmount>> response = fromJson(cachedJson,
-                                new TypeReference<ApiResponse<List<MerchantResponseYearlyTotalAmount>>>() {
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_year_total_amount_by_apikey")
+                .put("service.name", "merchant-total-amount-by-apikey-service")
+                .put("year", String.valueOf(year))
+                .build();
+
+        return tracingMetrics.traceAndMeasure("findYearTotalAmountByApiKey", "find_year_total_amount_by_apikey", attrs, () -> {
+            return redisService.getReactive(cacheKey)
+                    .chain(cachedJson -> {
+                        if (cachedJson != null) {
+                            logger.info("Cache HIT for key: {}", cacheKey);
+                            ApiResponse<List<MerchantResponseYearlyTotalAmount>> response = fromJson(cachedJson,
+                                    new TypeReference<ApiResponse<List<MerchantResponseYearlyTotalAmount>>>() {});
+                            return Uni.createFrom().item(response);
+                        }
+
+                        logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
+
+                        Long prevYear = year - 1L;
+
+                        return merchantTotalAmountByApiKeyRepository.findYearlyTotalAmountByApiKey(apiKey, year, prevYear)
+                                .chain(yearlyTotals -> {
+                                    List<MerchantResponseYearlyTotalAmount> responseList = yearlyTotals.stream()
+                                            .map(MerchantResponseYearlyTotalAmount::from)
+                                            .collect(Collectors.toList());
+
+                                    ApiResponse<List<MerchantResponseYearlyTotalAmount>> response = ApiResponse.success(
+                                            "Successfully fetched yearly total merchant amounts for year=" + year,
+                                            responseList);
+
+                                    return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                            .map(v -> {
+                                                logger.info("Cached yearly total merchant amounts by apiKey for year: {}", year);
+                                                return response;
+                                            });
                                 });
-                        return Uni.createFrom().item(response);
-                    }
-
-                    logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findYearTotalAmountByApiKey")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "merchant-total-amount-by-apikey-service")
-                            .setAttribute("operation", "find_year_total_amount_by_apikey")
-                            .setAttribute("year", year.toString())
-                            .startSpan();
-
-                    Long prevYear = year - 1L;
-
-                    return merchantTotalAmountByApiKeyRepository.findYearlyTotalAmountByApiKey(apiKey, year, prevYear)
-                            .chain(yearlyTotals -> {
-                                List<MerchantResponseYearlyTotalAmount> responseList = yearlyTotals.stream()
-                                        .map(MerchantResponseYearlyTotalAmount::from)
-                                        .collect(Collectors.toList());
-
-                                ApiResponse<List<MerchantResponseYearlyTotalAmount>> response = ApiResponse.success(
-                                        "Successfully fetched yearly total merchant amounts for year=" + year,
-                                        responseList
-                                );
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            logger.info("Cached yearly total merchant amounts by apiKey for year: {}", year);
-                                            span.setStatus(StatusCode.OK);
-
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_year_total_amount_by_apikey",
-                                                    AttributeKey.stringKey("status"), "success"));
-                                            return response;
-                                        });
-                            })
-                            .onFailure().invoke(e -> {
-                                logger.error("❌ Failed to fetch yearly total merchant amounts for year={} apiKey={}", year, apiKey, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_year_total_amount_by_apikey",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_year_total_amount_by_apikey"));
-                            });
-                });
+                    });
+        }).onFailure().invoke(e -> {
+            logger.error("❌ Failed to fetch yearly total merchant amounts for year={} apiKey={}", year, apiKey, e);
+        });
     }
 }

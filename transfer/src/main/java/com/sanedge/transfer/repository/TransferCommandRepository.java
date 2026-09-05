@@ -87,4 +87,86 @@ public class TransferCommandRepository implements PanacheRepository<Transfer> {
         return delete("deletedAt IS NOT NULL")
                 .map(count -> count > 0);
     }
+
+    @WithTransaction
+    public Uni<Boolean> markCompensationRequired(Long transferId, String reason) {
+        return find("transferId = ?1 AND deletedAt IS NULL", transferId).firstResult()
+                .chain(t -> {
+                    if (t != null) {
+                        t.compensationReason = reason;
+                        t.compensationAttempts = t.compensationAttempts != null ? t.compensationAttempts : 0;
+                        t.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(t).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> claimCompensation(Long transferId, String workerId, String claimToken,
+            java.sql.Timestamp now, java.sql.Timestamp leaseUntil, int maxAttempts) {
+        return find("transferId = ?1 AND (compensationWorkerId IS NULL OR compensationLeaseUntil < ?2)",
+                transferId, now).firstResult()
+                .chain(t -> {
+                    if (t != null) {
+                        int attempts = t.compensationAttempts != null ? t.compensationAttempts : 0;
+                        if (attempts >= maxAttempts) return Uni.createFrom().item(false);
+                        t.compensationWorkerId = workerId;
+                        t.compensationClaimToken = claimToken;
+                        t.compensationLeaseUntil = leaseUntil;
+                        t.compensationAttempts = attempts + 1;
+                        t.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(t).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> completeCompensation(Long transferId, String workerId, String claimToken) {
+        return find("transferId = ?1 AND compensationClaimToken = ?2", transferId, claimToken).firstResult()
+                .chain(t -> {
+                    if (t != null && workerId.equals(t.compensationWorkerId)) {
+                        t.compensationWorkerId = null;
+                        t.compensationClaimToken = null;
+                        t.compensationLeaseUntil = null;
+                        t.status = com.sanedge.common.enums.Status.SUCCESS;
+                        t.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(t).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> releaseCompensation(Long transferId, String workerId, String claimToken,
+            java.sql.Timestamp leaseUntil, String reason) {
+        return find("transferId = ?1 AND compensationClaimToken = ?2", transferId, claimToken).firstResult()
+                .chain(t -> {
+                    if (t != null && workerId.equals(t.compensationWorkerId)) {
+                        t.compensationWorkerId = null;
+                        t.compensationClaimToken = null;
+                        t.compensationLeaseUntil = leaseUntil;
+                        t.compensationReason = reason;
+                        t.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(t).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
+
+    @WithTransaction
+    public Uni<Boolean> exhaustCompensation(Long transferId, int maxAttempts, String reason) {
+        return find("transferId = ?1", transferId).firstResult()
+                .chain(t -> {
+                    if (t != null) {
+                        t.compensationAttempts = maxAttempts;
+                        t.compensationReason = reason;
+                        t.status = com.sanedge.common.enums.Status.FAILED;
+                        t.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                        return persist(t).map(v -> true);
+                    }
+                    return Uni.createFrom().item(false);
+                });
+    }
 }

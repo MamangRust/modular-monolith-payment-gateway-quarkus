@@ -9,6 +9,14 @@ import com.sanedge.common.utils.JwtUtil;
 import com.sanedge.common.utils.PasswordUtil;
 import com.sanedge.auth.entity.RefreshToken;
 import com.sanedge.auth.entity.ResetToken;
+import com.sanedge.auth.domain.requests.RegisterRequest;
+import com.sanedge.auth.domain.requests.LoginRequest;
+import com.sanedge.auth.domain.requests.RefreshTokenRequest;
+import com.sanedge.auth.domain.requests.ForgotPasswordRequest;
+import com.sanedge.auth.domain.requests.ResetPasswordRequest;
+import com.sanedge.auth.domain.requests.LogoutRequest;
+import com.sanedge.auth.domain.requests.VerifyCodeRequest;
+import com.sanedge.auth.domain.requests.GetMeRequest;
 import com.sanedge.auth.repository.RefreshTokenRepository;
 import com.sanedge.auth.repository.ResetTokenRepository;
 import io.quarkus.grpc.GrpcClient;
@@ -104,7 +112,12 @@ public class AuthService {
     }
 
     @WithTransaction
-    public Uni<UserResponse> register(String firstName, String lastName, String email, String password) {
+    public Uni<UserResponse> register(RegisterRequest req) {
+        String firstName = req.getFirstName();
+        String lastName = req.getLastName();
+        String email = req.getEmail();
+        String password = req.getPassword();
+
         long startTime = System.currentTimeMillis();
         Span span = tracer.spanBuilder("registerUser")
                 .setSpanKind(SpanKind.SERVER)
@@ -195,7 +208,10 @@ public class AuthService {
     }
 
     @WithTransaction
-    public Uni<String[]> login(String email, String password) {
+    public Uni<String[]> login(LoginRequest req) {
+        String email = req.getEmail();
+        String password = req.getPassword();
+
         long startTime = System.currentTimeMillis();
         Span span = tracer.spanBuilder("loginUser")
                 .setSpanKind(SpanKind.SERVER)
@@ -265,7 +281,8 @@ public class AuthService {
     }
 
     @WithTransaction
-    public Uni<String[]> refresh(String refreshTokenStr) {
+    public Uni<String[]> refresh(RefreshTokenRequest req) {
+        String refreshTokenStr = req.getRefreshToken();
         long startTime = System.currentTimeMillis();
         Span span = tracer.spanBuilder("refreshToken")
                 .setSpanKind(SpanKind.SERVER)
@@ -336,7 +353,8 @@ public class AuthService {
     }
 
     @WithTransaction
-    public Uni<Void> forgotPassword(String email) {
+    public Uni<Void> forgotPassword(ForgotPasswordRequest req) {
+        String email = req.getEmail();
         long startTime = System.currentTimeMillis();
         Span span = tracer.spanBuilder("forgotPassword")
                 .setSpanKind(SpanKind.SERVER)
@@ -390,7 +408,10 @@ public class AuthService {
     }
 
     @WithTransaction
-    public Uni<Void> resetPassword(String token, String password, String confirmPassword) {
+    public Uni<Void> resetPassword(ResetPasswordRequest req) {
+        String token = req.getToken();
+        String password = req.getPassword();
+        String confirmPassword = req.getConfirmPassword();
         long startTime = System.currentTimeMillis();
         Span span = tracer.spanBuilder("resetPassword")
                 .setSpanKind(SpanKind.SERVER)
@@ -467,7 +488,8 @@ public class AuthService {
     }
 
     @WithTransaction
-    public Uni<Void> logout(String refreshTokenStr) {
+    public Uni<Void> logout(LogoutRequest req) {
+        String refreshTokenStr = req.getRefreshToken();
         log.info("Attempting logout");
         return refreshTokenRepository.deleteByToken(refreshTokenStr)
                 .replaceWithVoid()
@@ -475,7 +497,8 @@ public class AuthService {
                 .onFailure().invoke(err -> log.error("Logout failed, error: {}", err.getMessage()));
     }
 
-    public Uni<Void> verifyEmailByCode(String code) {
+    public Uni<Void> verifyEmailByCode(VerifyCodeRequest req) {
+        String code = req.getCode();
         log.info("Attempting email verification with code: {}", code);
         String key = "verification_code:" + code;
         return redisService.getReactive(key)
@@ -492,7 +515,8 @@ public class AuthService {
                 .invoke(err -> log.error("Email verification failed for code: {}, error: {}", code, err.getMessage()));
     }
 
-    public Uni<UserResponse> getMe(Long userId) {
+    public Uni<UserResponse> getMe(GetMeRequest req) {
+        Long userId = req.getUserId();
         log.info("Fetching profile for user ID: {}", userId);
         return userQueryService.findById(FindByIdUserRequest.newBuilder().setId(userId.intValue()).build())
                 .map(res -> {

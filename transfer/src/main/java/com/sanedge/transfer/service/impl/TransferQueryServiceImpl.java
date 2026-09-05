@@ -15,22 +15,14 @@ import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.common.domain.response.ApiResponsePagination;
 import com.sanedge.common.domain.response.PaginationMeta;
 import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.transfer.domain.requests.FindAllTransfers;
 import com.sanedge.transfer.domain.response.TransferResponse;
 import com.sanedge.transfer.domain.response.TransferResponseDeleteAt;
 import com.sanedge.transfer.repository.TransferQueryRepository;
 import com.sanedge.transfer.service.TransferQueryService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -42,10 +34,7 @@ public class TransferQueryServiceImpl implements TransferQueryService {
     private final TransferQueryRepository transferQueryRepository;
     private final RedisService redisService;
     private final ObjectMapper objectMapper;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     private static final long QUERY_CACHE_TTL_SECONDS = 300;
 
@@ -53,20 +42,11 @@ public class TransferQueryServiceImpl implements TransferQueryService {
     public TransferQueryServiceImpl(TransferQueryRepository transferQueryRepository,
                                     RedisService redisService,
                                     ObjectMapper objectMapper,
-                                    OpenTelemetry openTelemetry) {
+                                    TracingMetrics tracingMetrics) {
         this.transferQueryRepository = transferQueryRepository;
         this.redisService = redisService;
         this.objectMapper = objectMapper;
-        this.tracer = openTelemetry.getTracer("transfer-query-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("transfer-query-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     private String toJson(Object obj) {
@@ -98,6 +78,12 @@ public class TransferQueryServiceImpl implements TransferQueryService {
 
         String cacheKey = String.format("transfers:all:%d:%d:%s", page, pageSize, search);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_all")
+                .put("page", page)
+                .put("size", pageSize)
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -109,68 +95,39 @@ public class TransferQueryServiceImpl implements TransferQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findAllTransfers")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-query-service")
-                            .setAttribute("operation", "find_all")
-                            .setAttribute("page", String.valueOf(page))
-                            .setAttribute("size", String.valueOf(pageSize))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findAllTransfers", "find_all", attrs,
+                            () -> transferQueryRepository.findTransfers(req)
+                                    .chain(pagedResult -> {
+                                        List<TransferResponse> data = pagedResult.getData().stream()
+                                                .map(TransferResponse::from)
+                                                .collect(Collectors.toList());
 
-                    return transferQueryRepository.findTransfers(search, page, pageSize)
-                            .chain(pagedResult -> {
-                                List<TransferResponse> data = pagedResult.getData().stream()
-                                        .map(TransferResponse::from)
-                                        .collect(Collectors.toList());
+                                        PaginationMeta meta = new PaginationMeta(
+                                                pagedResult.getTotalRecords(),
+                                                page + 1,
+                                                pageSize,
+                                                (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
+                                        );
 
-                                PaginationMeta meta = new PaginationMeta(
-                                        pagedResult.getTotalRecords(),
-                                        page + 1,
-                                        pageSize,
-                                        (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
-                                );
+                                        ApiResponsePagination<List<TransferResponse>> response = new ApiResponsePagination<>(
+                                                "success",
+                                                "Transfers retrieved successfully",
+                                                data,
+                                                meta
+                                        );
 
-                                ApiResponsePagination<List<TransferResponse>> response = new ApiResponsePagination<>(
-                                        "success",
-                                        "Transfers retrieved successfully",
-                                        data,
-                                        meta
-                                );
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_all",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return response;
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch transfers", e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_all",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponsePagination<>(
-                                        "error",
-                                        "Failed to fetch transfers",
-                                        Collections.emptyList(),
-                                        null
-                                );
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_all"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> response);
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch transfers", e);
+                                        return new ApiResponsePagination<>(
+                                                "error",
+                                                "Failed to fetch transfers",
+                                                Collections.emptyList(),
+                                                null
+                                        );
+                                    }));
                 });
     }
 
@@ -179,6 +136,11 @@ public class TransferQueryServiceImpl implements TransferQueryService {
         logger.info("🔍 Finding transfer by id={}", transferId);
 
         String cacheKey = String.format("transfers:id:%d", transferId);
+
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_by_id")
+                .put("transferId", String.valueOf(transferId))
+                .build();
 
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
@@ -189,50 +151,22 @@ public class TransferQueryServiceImpl implements TransferQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findTransferById")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-query-service")
-                            .setAttribute("operation", "find_by_id")
-                            .setAttribute("transferId", String.valueOf(transferId))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findTransferById", "find_by_id", attrs,
+                            () -> transferQueryRepository.findTransferById(transferId)
+                                    .chain(t -> {
+                                        if (t == null) {
+                                            throw new ResourceNotFoundException("Transfer not found with id " + transferId);
+                                        }
 
-                    return transferQueryRepository.findTransferById(transferId)
-                            .chain(t -> {
-                                if (t == null) {
-                                    throw new ResourceNotFoundException("Transfer not found with id " + transferId);
-                                }
+                                        TransferResponse response = TransferResponse.from(t);
 
-                                TransferResponse response = TransferResponse.from(t);
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_by_id",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Transfer retrieved successfully", response);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch transfer by id={}", transferId, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_by_id",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", e.getMessage(), null);
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_by_id"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success("Transfer retrieved successfully", response));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch transfer by id={}", transferId, e);
+                                        return new ApiResponse<>("error", e.getMessage(), null);
+                                    }));
                 });
     }
 
@@ -246,6 +180,12 @@ public class TransferQueryServiceImpl implements TransferQueryService {
 
         String cacheKey = String.format("transfers:active:%d:%d:%s", page, pageSize, search);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_active")
+                .put("page", page)
+                .put("size", pageSize)
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -257,68 +197,39 @@ public class TransferQueryServiceImpl implements TransferQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findActiveTransfers")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-query-service")
-                            .setAttribute("operation", "find_active")
-                            .setAttribute("page", String.valueOf(page))
-                            .setAttribute("size", String.valueOf(pageSize))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findActiveTransfers", "find_active", attrs,
+                            () -> transferQueryRepository.findActiveTransfers(req)
+                                    .chain(pagedResult -> {
+                                        List<TransferResponseDeleteAt> data = pagedResult.getData().stream()
+                                                .map(TransferResponseDeleteAt::from)
+                                                .collect(Collectors.toList());
 
-                    return transferQueryRepository.findActiveTransfers(search, page, pageSize)
-                            .chain(pagedResult -> {
-                                List<TransferResponseDeleteAt> data = pagedResult.getData().stream()
-                                        .map(TransferResponseDeleteAt::from)
-                                        .collect(Collectors.toList());
+                                        PaginationMeta meta = new PaginationMeta(
+                                                pagedResult.getTotalRecords(),
+                                                page + 1,
+                                                pageSize,
+                                                (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
+                                        );
 
-                                PaginationMeta meta = new PaginationMeta(
-                                        pagedResult.getTotalRecords(),
-                                        page + 1,
-                                        pageSize,
-                                        (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
-                                );
+                                        ApiResponsePagination<List<TransferResponseDeleteAt>> response = new ApiResponsePagination<>(
+                                                "success",
+                                                "Active transfers retrieved successfully",
+                                                data,
+                                                meta
+                                        );
 
-                                ApiResponsePagination<List<TransferResponseDeleteAt>> response = new ApiResponsePagination<>(
-                                        "success",
-                                        "Active transfers retrieved successfully",
-                                        data,
-                                        meta
-                                );
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_active",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return response;
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch active transfers", e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_active",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponsePagination<>(
-                                        "error",
-                                        "Failed to fetch active transfers",
-                                        Collections.emptyList(),
-                                        null
-                                );
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_active"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> response);
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch active transfers", e);
+                                        return new ApiResponsePagination<>(
+                                                "error",
+                                                "Failed to fetch active transfers",
+                                                Collections.emptyList(),
+                                                null
+                                        );
+                                    }));
                 });
     }
 
@@ -332,6 +243,12 @@ public class TransferQueryServiceImpl implements TransferQueryService {
 
         String cacheKey = String.format("transfers:trashed:%d:%d:%s", page, pageSize, search);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_trashed")
+                .put("page", page)
+                .put("size", pageSize)
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -343,68 +260,39 @@ public class TransferQueryServiceImpl implements TransferQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findTrashedTransfers")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-query-service")
-                            .setAttribute("operation", "find_trashed")
-                            .setAttribute("page", String.valueOf(page))
-                            .setAttribute("size", String.valueOf(pageSize))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findTrashedTransfers", "find_trashed", attrs,
+                            () -> transferQueryRepository.findTrashedTransfers(req)
+                                    .chain(pagedResult -> {
+                                        List<TransferResponseDeleteAt> data = pagedResult.getData().stream()
+                                                .map(TransferResponseDeleteAt::from)
+                                                .collect(Collectors.toList());
 
-                    return transferQueryRepository.findTrashedTransfers(search, page, pageSize)
-                            .chain(pagedResult -> {
-                                List<TransferResponseDeleteAt> data = pagedResult.getData().stream()
-                                        .map(TransferResponseDeleteAt::from)
-                                        .collect(Collectors.toList());
+                                        PaginationMeta meta = new PaginationMeta(
+                                                pagedResult.getTotalRecords(),
+                                                page + 1,
+                                                pageSize,
+                                                (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
+                                        );
 
-                                PaginationMeta meta = new PaginationMeta(
-                                        pagedResult.getTotalRecords(),
-                                        page + 1,
-                                        pageSize,
-                                        (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
-                                );
+                                        ApiResponsePagination<List<TransferResponseDeleteAt>> response = new ApiResponsePagination<>(
+                                                "success",
+                                                "Trashed transfers retrieved successfully",
+                                                data,
+                                                meta
+                                        );
 
-                                ApiResponsePagination<List<TransferResponseDeleteAt>> response = new ApiResponsePagination<>(
-                                        "success",
-                                        "Trashed transfers retrieved successfully",
-                                        data,
-                                        meta
-                                );
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_trashed",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return response;
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch trashed transfers", e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_trashed",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponsePagination<>(
-                                        "error",
-                                        "Failed to fetch trashed transfers",
-                                        Collections.emptyList(),
-                                        null
-                                );
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_trashed"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> response);
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch trashed transfers", e);
+                                        return new ApiResponsePagination<>(
+                                                "error",
+                                                "Failed to fetch trashed transfers",
+                                                Collections.emptyList(),
+                                                null
+                                        );
+                                    }));
                 });
     }
 
@@ -413,6 +301,11 @@ public class TransferQueryServiceImpl implements TransferQueryService {
         logger.info("💸 Finding transfers by transferFrom={}", transferFrom);
 
         String cacheKey = String.format("transfers:from:%s", transferFrom);
+
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_by_transfer_from")
+                .put("transferFrom", transferFrom)
+                .build();
 
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
@@ -423,48 +316,20 @@ public class TransferQueryServiceImpl implements TransferQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findTransfersByTransferFrom")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-query-service")
-                            .setAttribute("operation", "find_by_transfer_from")
-                            .setAttribute("transferFrom", transferFrom)
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findTransfersByTransferFrom", "find_by_transfer_from", attrs,
+                            () -> transferQueryRepository.findTransfersBySourceCard(transferFrom)
+                                    .chain(transfers -> {
+                                        List<TransferResponse> data = transfers.stream()
+                                                .map(TransferResponse::from)
+                                                .collect(Collectors.toList());
 
-                    return transferQueryRepository.findTransfersBySourceCard(transferFrom)
-                            .chain(transfers -> {
-                                List<TransferResponse> data = transfers.stream()
-                                        .map(TransferResponse::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(data), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_by_transfer_from",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Transfers by sender retrieved successfully", data);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch transfers by transferFrom={}", transferFrom, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_by_transfer_from",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch transfers", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_by_transfer_from"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(data), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success("Transfers by sender retrieved successfully", data));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch transfers by transferFrom={}", transferFrom, e);
+                                        return new ApiResponse<>("error", "Failed to fetch transfers", Collections.emptyList());
+                                    }));
                 });
     }
 
@@ -473,6 +338,11 @@ public class TransferQueryServiceImpl implements TransferQueryService {
         logger.info("💸 Finding transfers by transferTo={}", transferTo);
 
         String cacheKey = String.format("transfers:to:%s", transferTo);
+
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_by_transfer_to")
+                .put("transferTo", transferTo)
+                .build();
 
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
@@ -483,48 +353,20 @@ public class TransferQueryServiceImpl implements TransferQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findTransfersByTransferTo")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-query-service")
-                            .setAttribute("operation", "find_by_transfer_to")
-                            .setAttribute("transferTo", transferTo)
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findTransfersByTransferTo", "find_by_transfer_to", attrs,
+                            () -> transferQueryRepository.findTransfersByDestinationCard(transferTo)
+                                    .chain(transfers -> {
+                                        List<TransferResponse> data = transfers.stream()
+                                                .map(TransferResponse::from)
+                                                .collect(Collectors.toList());
 
-                    return transferQueryRepository.findTransfersByDestinationCard(transferTo)
-                            .chain(transfers -> {
-                                List<TransferResponse> data = transfers.stream()
-                                        .map(TransferResponse::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(data), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_by_transfer_to",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Transfers by receiver retrieved successfully", data);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch transfers by transferTo={}", transferTo, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_by_transfer_to",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch transfers", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_by_transfer_to"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(data), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success("Transfers by receiver retrieved successfully", data));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch transfers by transferTo={}", transferTo, e);
+                                        return new ApiResponse<>("error", "Failed to fetch transfers", Collections.emptyList());
+                                    }));
                 });
     }
 }

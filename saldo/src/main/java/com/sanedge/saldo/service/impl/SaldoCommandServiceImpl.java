@@ -7,26 +7,19 @@ import com.sanedge.common.config.RedisService;
 import com.sanedge.saldo.domain.requests.CreateSaldoRequest;
 import com.sanedge.saldo.domain.requests.UpdateSaldoRequest;
 import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.saldo.domain.response.SaldoResponse;
 import com.sanedge.saldo.domain.response.SaldoResponseDeleteAt;
 import com.sanedge.saldo.entity.Saldo;
 import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.common.exception.InvalidRequestException;
 import pb.card.CardQueryService;
 import io.quarkus.grpc.GrpcClient;
 import com.sanedge.saldo.repository.SaldoCommandRepository;
 import com.sanedge.saldo.repository.SaldoQueryRepository;
 import com.sanedge.saldo.service.SaldoCommandService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -40,548 +33,356 @@ public class SaldoCommandServiceImpl implements SaldoCommandService {
     private final SaldoCommandRepository saldoCommandRepository;
     private final SaldoQueryRepository saldoQueryRepository;
     private final RedisService redisService;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     @Inject
     public SaldoCommandServiceImpl(@GrpcClient("card") CardQueryService cardQueryService,
                                   SaldoCommandRepository saldoCommandRepository,
                                   SaldoQueryRepository saldoQueryRepository,
-                                  OpenTelemetry openTelemetry,
-                                  RedisService redisService) {
+                                  RedisService redisService,
+                                  TracingMetrics tracingMetrics) {
         this.cardQueryService = cardQueryService;
         this.saldoCommandRepository = saldoCommandRepository;
         this.saldoQueryRepository = saldoQueryRepository;
         this.redisService = redisService;
-        this.tracer = openTelemetry.getTracer("saldo-command-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("saldo-command-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     @Override
     @WithTransaction
     public Uni<ApiResponse<SaldoResponse>> create(CreateSaldoRequest request) {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("createSaldo")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "saldo-command-service")
-                .setAttribute("operation", "create_saldo")
-                .setAttribute("cardNumber", request.getCardNumber())
-                .startSpan();
-
         logger.info("Creating saldo for card_number={}", request.getCardNumber());
 
-        return cardQueryService.findByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(request.getCardNumber()).build())
-                .chain(cardResponse -> {
-                    if (cardResponse == null || !cardResponse.hasData()) {
-                        logger.error("Card {} not found", request.getCardNumber());
-                        throw new ResourceNotFoundException("Card not found");
-                    }
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-command-service")
+                .put("operation", "create_saldo")
+                .put("cardNumber", request.getCardNumber())
+                .build();
 
-                    Saldo saldo = new Saldo();
-                    saldo.setCardNumber(request.getCardNumber());
-                    saldo.setTotalBalance(request.getTotalBalance().intValue());
-                    saldo.setWithdrawAmount(0);
-                    saldo.setWithdrawTime(null);
-                    saldo.setCreatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
-                    saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+        return tracingMetrics.<ApiResponse<SaldoResponse>>traceAndMeasure(
+                "createSaldo", "create_saldo", attrs, () ->
 
-                    return saldoCommandRepository.persist(saldo)
-                            .chain(savedSaldo -> {
-                                logger.info("Saldo created successfully with id={} for card={}", savedSaldo.getSaldoId(), request.getCardNumber());
-                                String cacheKey = "saldo:card:" + request.getCardNumber();
+                cardQueryService.findByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(request.getCardNumber()).build())
+                        .chain(cardResponse -> {
+                            if (cardResponse == null || !cardResponse.hasData()) {
+                                logger.error("Card {} not found", request.getCardNumber());
+                                throw new ResourceNotFoundException("Card not found");
+                            }
 
-                                return redisService.deleteReactive(cacheKey)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "create_saldo",
-                                                    AttributeKey.stringKey("status"), "success"));
+                            Saldo saldo = new Saldo();
+                            saldo.setCardNumber(request.getCardNumber());
+                            saldo.setTotalBalance(request.getTotalBalance().intValue());
+                            saldo.setWithdrawAmount(0);
+                            saldo.setWithdrawTime(null);
+                            saldo.setCreatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                            saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
 
-                                            return ApiResponse.success("Create saldo success", SaldoResponse.from(savedSaldo));
-                                        });
-                            });
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to create saldo for card_number={}", request.getCardNumber(), e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
+                            return saldoCommandRepository.persist(saldo)
+                                    .chain(savedSaldo -> {
+                                        logger.info("Saldo created successfully with id={} for card={}", savedSaldo.getSaldoId(), request.getCardNumber());
+                                        String cacheKey = "saldo:card:" + request.getCardNumber();
 
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "create_saldo",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", e.getMessage(), null);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "create_saldo"));
-                });
+                                        return redisService.deleteReactive(cacheKey)
+                                                .map(v -> ApiResponse.success("Create saldo success", SaldoResponse.from(savedSaldo)));
+                                    });
+                        })
+                        .onFailure().recoverWithItem(e -> {
+                            logger.error("💥 Failed to create saldo for card_number={}", request.getCardNumber(), e);
+                            return new ApiResponse<>("error", e.getMessage(), null);
+                        }));
     }
 
     @Override
     @WithTransaction
     public Uni<ApiResponse<SaldoResponse>> update(UpdateSaldoRequest request) {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("updateSaldo")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "saldo-command-service")
-                .setAttribute("operation", "update_saldo")
-                .setAttribute("saldo.id", String.valueOf(request.getSaldoId()))
-                .setAttribute("cardNumber", request.getCardNumber())
-                .startSpan();
-
         logger.info("Updating saldo id={} for card={}", request.getSaldoId(), request.getCardNumber());
 
-        if (request.getSaldoId() == null) {
-            logger.error("saldo_id is required");
-            span.setStatus(StatusCode.ERROR, "saldo_id is required");
-            span.end();
-            return Uni.createFrom().item(new ApiResponse<>("error", "saldo_id is required", null));
-        }
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-command-service")
+                .put("operation", "update_saldo")
+                .put("saldo.id", String.valueOf(request.getSaldoId()))
+                .put("cardNumber", request.getCardNumber())
+                .build();
 
-        return cardQueryService.findByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(request.getCardNumber()).build())
-                .chain(cardResponse -> {
-                    if (cardResponse == null || !cardResponse.hasData()) {
-                        logger.error("Card {} not found during update", request.getCardNumber());
-                        throw new ResourceNotFoundException("Card not found");
-                    }
-                    return saldoQueryRepository.findById(request.getSaldoId());
-                })
-                .chain(saldo -> {
-                    if (saldo == null) {
-                        logger.error("Saldo not found with id {}", request.getSaldoId());
-                        throw new ResourceNotFoundException("Saldo not found");
+        return tracingMetrics.<ApiResponse<SaldoResponse>>traceAndMeasure(
+                "updateSaldo", "update_saldo", attrs, () -> {
+
+                    if (request.getSaldoId() == null) {
+                        logger.error("saldo_id is required");
+                        return Uni.createFrom().item(new ApiResponse<>("error", "saldo_id is required", null));
                     }
 
-                    saldo.setCardNumber(request.getCardNumber());
-                    saldo.setTotalBalance(request.getTotalBalance().intValue());
-                    saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                    return cardQueryService.findByCardNumber(pb.card.Card.FindByCardNumberRequest.newBuilder().setCardNumber(request.getCardNumber()).build())
+                            .chain(cardResponse -> {
+                                if (cardResponse == null || !cardResponse.hasData()) {
+                                    logger.error("Card {} not found during update", request.getCardNumber());
+                                    throw new ResourceNotFoundException("Card not found");
+                                }
+                                return saldoQueryRepository.findById(request.getSaldoId());
+                            })
+                            .chain(saldo -> {
+                                if (saldo == null) {
+                                    logger.error("Saldo not found with id {}", request.getSaldoId());
+                                    throw new ResourceNotFoundException("Saldo not found");
+                                }
 
-                    return saldoCommandRepository.persist(saldo)
-                            .chain(updatedSaldo -> {
-                                logger.info("Saldo updated successfully with id={} for card={}", updatedSaldo.getSaldoId(), request.getCardNumber());
-                                String cacheId = "saldo:id:" + request.getSaldoId();
-                                String cacheCard = "saldo:card:" + request.getCardNumber();
+                                saldo.setCardNumber(request.getCardNumber());
+                                saldo.setTotalBalance(request.getTotalBalance().intValue());
+                                saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
 
-                                return Uni.combine().all().unis(
-                                        redisService.deleteReactive(cacheId),
-                                        redisService.deleteReactive(cacheCard)
-                                ).asTuple().map(t -> {
-                                    span.setStatus(StatusCode.OK);
-                                    requestsTotal.add(1, Attributes.of(
-                                            AttributeKey.stringKey("operation"), "update_saldo",
-                                            AttributeKey.stringKey("status"), "success"));
+                                return saldoCommandRepository.persist(saldo)
+                                        .chain(updatedSaldo -> {
+                                            logger.info("Saldo updated successfully with id={} for card={}", updatedSaldo.getSaldoId(), request.getCardNumber());
+                                            String cacheId = "saldo:id:" + request.getSaldoId();
+                                            String cacheCard = "saldo:card:" + request.getCardNumber();
 
-                                    return ApiResponse.success("Update saldo success", SaldoResponse.from(updatedSaldo));
-                                });
+                                            return Uni.combine().all().unis(
+                                                    redisService.deleteReactive(cacheId),
+                                                    redisService.deleteReactive(cacheCard)
+                                            ).asTuple().map(t -> ApiResponse.success("Update saldo success", SaldoResponse.from(updatedSaldo)));
+                                        });
+                            })
+                            .onFailure().recoverWithItem(e -> {
+                                logger.error("💥 Failed to update saldo id={} for card={}", request.getSaldoId(), request.getCardNumber(), e);
+                                return new ApiResponse<>("error", e.getMessage(), null);
                             });
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to update saldo id={} for card={}", request.getSaldoId(), request.getCardNumber(), e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "update_saldo",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", e.getMessage(), null);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "update_saldo"));
                 });
     }
 
     @Override
     @WithTransaction
     public Uni<ApiResponse<SaldoResponseDeleteAt>> trash(Long id) {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("trashSaldo")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "saldo-command-service")
-                .setAttribute("operation", "trash_saldo")
-                .setAttribute("saldo.id", String.valueOf(id))
-                .startSpan();
-
         logger.info("🗑️ Trashing saldo id={}", id);
 
-        return saldoCommandRepository.trashed(id)
-                .chain(saldo -> {
-                    if (saldo == null) {
-                        logger.error("Saldo not found with id {}", id);
-                        throw new ResourceNotFoundException("Saldo not found");
-                    }
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-command-service")
+                .put("operation", "trash_saldo")
+                .put("saldo.id", String.valueOf(id))
+                .build();
 
-                    String cacheId = "saldo:id:" + id;
-                    String cacheCard = "saldo:card:" + saldo.getCardNumber();
+        return tracingMetrics.<ApiResponse<SaldoResponseDeleteAt>>traceAndMeasure(
+                "trashSaldo", "trash_saldo", attrs, () ->
 
-                    return Uni.combine().all().unis(
-                            redisService.deleteReactive(cacheId),
-                            redisService.deleteReactive(cacheCard)
-                    ).asTuple().map(t -> {
-                        span.setStatus(StatusCode.OK);
-                        requestsTotal.add(1, Attributes.of(
-                                AttributeKey.stringKey("operation"), "trash_saldo",
-                                AttributeKey.stringKey("status"), "success"));
+                saldoCommandRepository.trashed(id)
+                        .chain(saldo -> {
+                            if (saldo == null) {
+                                logger.error("Saldo not found with id {}", id);
+                                throw new ResourceNotFoundException("Saldo not found");
+                            }
 
-                        return ApiResponse.success("Trash saldo success", SaldoResponseDeleteAt.from(saldo));
-                    });
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to trash saldo id={}", id, e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
+                            String cacheId = "saldo:id:" + id;
+                            String cacheCard = "saldo:card:" + saldo.getCardNumber();
 
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "trash_saldo",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", e.getMessage(), null);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "trash_saldo"));
-                });
+                            return Uni.combine().all().unis(
+                                    redisService.deleteReactive(cacheId),
+                                    redisService.deleteReactive(cacheCard)
+                            ).asTuple().map(t -> ApiResponse.success("Trash saldo success", SaldoResponseDeleteAt.from(saldo)));
+                        })
+                        .onFailure().recoverWithItem(e -> {
+                            logger.error("💥 Failed to trash saldo id={}", id, e);
+                            return new ApiResponse<>("error", e.getMessage(), null);
+                        }));
     }
 
     @Override
     @WithTransaction
     public Uni<ApiResponse<SaldoResponseDeleteAt>> restore(Long id) {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("restoreSaldo")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "saldo-command-service")
-                .setAttribute("operation", "restore_saldo")
-                .setAttribute("saldo.id", String.valueOf(id))
-                .startSpan();
-
         logger.info("♻️ Restoring saldo id={}", id);
 
-        return saldoCommandRepository.restore(id)
-                .chain(saldo -> {
-                    if (saldo == null) {
-                        logger.error("Saldo not found with id {}", id);
-                        throw new ResourceNotFoundException("Saldo not found");
-                    }
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-command-service")
+                .put("operation", "restore_saldo")
+                .put("saldo.id", String.valueOf(id))
+                .build();
 
-                    String cacheId = "saldo:id:" + id;
-                    String cacheCard = "saldo:card:" + saldo.getCardNumber();
+        return tracingMetrics.<ApiResponse<SaldoResponseDeleteAt>>traceAndMeasure(
+                "restoreSaldo", "restore_saldo", attrs, () ->
 
-                    return Uni.combine().all().unis(
-                            redisService.deleteReactive(cacheId),
-                            redisService.deleteReactive(cacheCard)
-                    ).asTuple().map(t -> {
-                        span.setStatus(StatusCode.OK);
-                        requestsTotal.add(1, Attributes.of(
-                                AttributeKey.stringKey("operation"), "restore_saldo",
-                                AttributeKey.stringKey("status"), "success"));
+                saldoCommandRepository.restore(id)
+                        .chain(saldo -> {
+                            if (saldo == null) {
+                                logger.error("Saldo with id {} must be trashed first", id);
+                                throw new InvalidRequestException("Saldo must be trashed first");
+                            }
 
-                        return ApiResponse.success("Restore saldo success", SaldoResponseDeleteAt.from(saldo));
-                    });
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to restore saldo id={}", id, e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
+                            String cacheId = "saldo:id:" + id;
+                            String cacheCard = "saldo:card:" + saldo.getCardNumber();
 
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "restore_saldo",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", e.getMessage(), null);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "restore_saldo"));
-                });
+                            return Uni.combine().all().unis(
+                                    redisService.deleteReactive(cacheId),
+                                    redisService.deleteReactive(cacheCard)
+                            ).asTuple().map(t -> ApiResponse.success("Restore saldo success", SaldoResponseDeleteAt.from(saldo)));
+                        }));
     }
 
     @Override
     @WithTransaction
     public Uni<ApiResponse<Boolean>> delete(Long id) {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("deleteSaldo")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "saldo-command-service")
-                .setAttribute("operation", "delete_saldo")
-                .setAttribute("saldo.id", String.valueOf(id))
-                .startSpan();
-
         logger.info("🧨 Permanently deleting saldo id={}", id);
 
-        return saldoQueryRepository.findById(id)
-                .chain(saldo -> {
-                    if (saldo == null) {
-                        logger.error("Saldo not found with id {}", id);
-                        throw new ResourceNotFoundException("Saldo not found");
-                    }
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-command-service")
+                .put("operation", "delete_saldo")
+                .put("saldo.id", String.valueOf(id))
+                .build();
 
-                    String cacheId = "saldo:id:" + id;
-                    String cacheCard = "saldo:card:" + saldo.getCardNumber();
+        return tracingMetrics.<ApiResponse<Boolean>>traceAndMeasure(
+                "deleteSaldo", "delete_saldo", attrs, () ->
 
-                    return saldoCommandRepository.deletePermanent(id)
-                            .chain(deleted -> Uni.combine().all().unis(
-                                    redisService.deleteReactive(cacheId),
-                                    redisService.deleteReactive(cacheCard)
-                            ).asTuple().map(t -> {
-                                span.setStatus(StatusCode.OK);
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "delete_saldo",
-                                        AttributeKey.stringKey("status"), "success"));
+                saldoQueryRepository.findById(id)
+                        .chain(saldo -> {
+                            if (saldo == null) {
+                                logger.error("Saldo not found with id {}", id);
+                                throw new ResourceNotFoundException("Saldo not found");
+                            }
 
-                                return ApiResponse.success("Delete saldo success", deleted);
-                            }));
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to permanently delete saldo id={}", id, e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
+                            if (saldo.getDeletedAt() == null) {
+                                logger.error("Saldo with id {} must be trashed before permanent deletion", id);
+                                throw new InvalidRequestException("Saldo must be trashed before permanent deletion");
+                            }
 
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "delete_saldo",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
+                            String cacheId = "saldo:id:" + id;
+                            String cacheCard = "saldo:card:" + saldo.getCardNumber();
 
-                    return new ApiResponse<>("error", e.getMessage(), false);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "delete_saldo"));
-                });
+                            return saldoCommandRepository.deletePermanent(id)
+                                    .chain(deleted -> Uni.combine().all().unis(
+                                            redisService.deleteReactive(cacheId),
+                                            redisService.deleteReactive(cacheCard)
+                                    ).asTuple().map(t -> ApiResponse.success("Delete saldo success", deleted)));
+                        }));
     }
 
     @Override
     @WithTransaction
     public Uni<ApiResponse<Boolean>> restoreAll() {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("restoreAllSaldos")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "saldo-command-service")
-                .setAttribute("operation", "restore_all_saldos")
-                .startSpan();
-
         logger.info("🔄 Restoring ALL trashed saldos");
 
-        return saldoCommandRepository.restoreAllDeleted()
-                .map(restored -> {
-                    span.setStatus(StatusCode.OK);
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "restore_all_saldos",
-                            AttributeKey.stringKey("status"), "success"));
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-command-service")
+                .put("operation", "restore_all_saldos")
+                .build();
 
-                    return ApiResponse.success("Restore all saldo success", restored);
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to restore all saldos", e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
+        return tracingMetrics.<ApiResponse<Boolean>>traceAndMeasure(
+                "restoreAllSaldos", "restore_all_saldos", attrs, () ->
 
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "restore_all_saldos",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", e.getMessage(), false);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "restore_all_saldos"));
-                });
+                saldoCommandRepository.restoreAllDeleted()
+                        .map(restored -> {
+                            if (!restored) {
+                                logger.error("No trashed saldos to restore");
+                                throw new ResourceNotFoundException("No trashed saldos to restore");
+                            }
+                            return ApiResponse.success("Restore all saldo success", true);
+                        }));
     }
 
     @Override
     @WithTransaction
     public Uni<ApiResponse<Boolean>> deleteAll() {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("deleteAllSaldos")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "saldo-command-service")
-                .setAttribute("operation", "delete_all_saldos")
-                .startSpan();
-
         logger.info("💣 Permanently deleting ALL trashed saldos");
 
-        return saldoCommandRepository.deleteAllDeleted()
-                .map(deleted -> {
-                    span.setStatus(StatusCode.OK);
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "delete_all_saldos",
-                            AttributeKey.stringKey("status"), "success"));
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-command-service")
+                .put("operation", "delete_all_saldos")
+                .build();
 
-                    return ApiResponse.success("Delete all saldo success", deleted);
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to delete all saldos", e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
+        return tracingMetrics.<ApiResponse<Boolean>>traceAndMeasure(
+                "deleteAllSaldos", "delete_all_saldos", attrs, () ->
 
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "delete_all_saldos",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", e.getMessage(), false);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "delete_all_saldos"));
-                });
+                saldoCommandRepository.deleteAllDeleted()
+                        .map(deleted -> {
+                            if (!deleted) {
+                                logger.error("No trashed saldos to delete");
+                                throw new ResourceNotFoundException("No trashed saldos to delete");
+                            }
+                            return ApiResponse.success("Delete all saldo success", true);
+                        }));
     }
 
     @Override
     @WithTransaction
     public Uni<ApiResponse<SaldoResponse>> updateSaldoBalance(com.sanedge.saldo.domain.requests.UpdateSaldoBalance request) {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("updateSaldoBalance")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "saldo-command-service")
-                .setAttribute("operation", "update_saldo_balance")
-                .setAttribute("cardNumber", request.getCardNumber())
-                .startSpan();
-
         logger.info("Updating saldo balance for card_number={}", request.getCardNumber());
 
-        return saldoQueryRepository.findByCardNumber(request.getCardNumber())
-                .chain(saldo -> {
-                    if (saldo == null) {
-                        logger.error("Saldo not found for card {}", request.getCardNumber());
-                        throw new ResourceNotFoundException("Saldo not found");
-                    }
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-command-service")
+                .put("operation", "update_saldo_balance")
+                .put("cardNumber", request.getCardNumber())
+                .build();
 
-                    saldo.setTotalBalance(request.getTotalBalance().intValue());
-                    saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+        return tracingMetrics.<ApiResponse<SaldoResponse>>traceAndMeasure(
+                "updateSaldoBalance", "update_saldo_balance", attrs, () ->
 
-                    return saldoCommandRepository.persist(saldo)
-                            .chain(savedSaldo -> {
-                                String cacheId = "saldo:id:" + savedSaldo.getSaldoId();
-                                String cacheCard = "saldo:card:" + request.getCardNumber();
+                saldoQueryRepository.findByCardNumber(request.getCardNumber())
+                        .chain(saldo -> {
+                            if (saldo == null) {
+                                logger.error("Saldo not found for card {}", request.getCardNumber());
+                                throw new ResourceNotFoundException("Saldo not found");
+                            }
 
-                                return Uni.combine().all().unis(
-                                        redisService.deleteReactive(cacheId),
-                                        redisService.deleteReactive(cacheCard)
-                                ).asTuple().map(t -> {
-                                    span.setStatus(StatusCode.OK);
-                                    requestsTotal.add(1, Attributes.of(
-                                            AttributeKey.stringKey("operation"), "update_saldo_balance",
-                                            AttributeKey.stringKey("status"), "success"));
+                            saldo.setTotalBalance(request.getTotalBalance().intValue());
+                            saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
 
-                                    return ApiResponse.success("Update saldo balance success", SaldoResponse.from(savedSaldo));
-                                });
-                            });
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to update saldo balance for card_number={}", request.getCardNumber(), e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
+                            return saldoCommandRepository.persist(saldo)
+                                    .chain(savedSaldo -> {
+                                        String cacheId = "saldo:id:" + savedSaldo.getSaldoId();
+                                        String cacheCard = "saldo:card:" + request.getCardNumber();
 
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "update_saldo_balance",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", e.getMessage(), null);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "update_saldo_balance"));
-                });
+                                        return Uni.combine().all().unis(
+                                                redisService.deleteReactive(cacheId),
+                                                redisService.deleteReactive(cacheCard)
+                                        ).asTuple().map(t -> ApiResponse.success("Update saldo balance success", SaldoResponse.from(savedSaldo)));
+                                    });
+                        })
+                        .onFailure().recoverWithItem(e -> {
+                            logger.error("💥 Failed to update saldo balance for card_number={}", request.getCardNumber(), e);
+                            return new ApiResponse<>("error", e.getMessage(), null);
+                        }));
     }
 
     @Override
     @WithTransaction
     public Uni<ApiResponse<SaldoResponse>> updateSaldoWithdraw(com.sanedge.saldo.domain.requests.UpdateSaldoWithdraw request) {
-        long startTime = System.currentTimeMillis();
-        Span span = tracer.spanBuilder("updateSaldoWithdraw")
-                .setSpanKind(SpanKind.SERVER)
-                .setAttribute("service.name", "saldo-command-service")
-                .setAttribute("operation", "update_saldo_withdraw")
-                .setAttribute("cardNumber", request.getCardNumber())
-                .startSpan();
-
         logger.info("Updating saldo withdraw for card_number={}", request.getCardNumber());
 
-        return saldoQueryRepository.findByCardNumber(request.getCardNumber())
-                .chain(saldo -> {
-                    if (saldo == null) {
-                        logger.error("Saldo not found for card {}", request.getCardNumber());
-                        throw new ResourceNotFoundException("Saldo not found");
-                    }
+        Attributes attrs = Attributes.builder()
+                .put("service.name", "saldo-command-service")
+                .put("operation", "update_saldo_withdraw")
+                .put("cardNumber", request.getCardNumber())
+                .build();
 
-                    saldo.setTotalBalance(request.getTotalBalance().intValue());
-                    saldo.setWithdrawAmount(request.getWithdrawAmount().intValue());
-                    if (request.getWithdrawTime() != null) {
-                        saldo.setWithdrawTime(java.sql.Timestamp.valueOf(request.getWithdrawTime()));
-                    } else {
-                        saldo.setWithdrawTime(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
-                    }
-                    saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+        return tracingMetrics.<ApiResponse<SaldoResponse>>traceAndMeasure(
+                "updateSaldoWithdraw", "update_saldo_withdraw", attrs, () ->
 
-                    return saldoCommandRepository.persist(saldo)
-                            .chain(savedSaldo -> {
-                                String cacheId = "saldo:id:" + savedSaldo.getSaldoId();
-                                String cacheCard = "saldo:card:" + request.getCardNumber();
+                saldoQueryRepository.findByCardNumber(request.getCardNumber())
+                        .chain(saldo -> {
+                            if (saldo == null) {
+                                logger.error("Saldo not found for card {}", request.getCardNumber());
+                                throw new ResourceNotFoundException("Saldo not found");
+                            }
 
-                                return Uni.combine().all().unis(
-                                        redisService.deleteReactive(cacheId),
-                                        redisService.deleteReactive(cacheCard)
-                                ).asTuple().map(t -> {
-                                    span.setStatus(StatusCode.OK);
-                                    requestsTotal.add(1, Attributes.of(
-                                            AttributeKey.stringKey("operation"), "update_saldo_withdraw",
-                                            AttributeKey.stringKey("status"), "success"));
+                            saldo.setTotalBalance(request.getTotalBalance().intValue());
+                            saldo.setWithdrawAmount(request.getWithdrawAmount().intValue());
+                            if (request.getWithdrawTime() != null) {
+                                saldo.setWithdrawTime(java.sql.Timestamp.valueOf(request.getWithdrawTime()));
+                            } else {
+                                saldo.setWithdrawTime(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                            }
+                            saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
 
-                                    return ApiResponse.success("Update saldo withdraw success", SaldoResponse.from(savedSaldo));
-                                });
-                            });
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to update saldo withdraw for card_number={}", request.getCardNumber(), e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
+                            return saldoCommandRepository.persist(saldo)
+                                    .chain(savedSaldo -> {
+                                        String cacheId = "saldo:id:" + savedSaldo.getSaldoId();
+                                        String cacheCard = "saldo:card:" + request.getCardNumber();
 
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "update_saldo_withdraw",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", e.getMessage(), null);
-                })
-                .eventually(() -> {
-                    span.end();
-                    double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                    requestDurationSeconds.record(duration, Attributes.of(
-                            AttributeKey.stringKey("operation"), "update_saldo_withdraw"));
-                });
+                                        return Uni.combine().all().unis(
+                                                redisService.deleteReactive(cacheId),
+                                                redisService.deleteReactive(cacheCard)
+                                        ).asTuple().map(t -> ApiResponse.success("Update saldo withdraw success", SaldoResponse.from(savedSaldo)));
+                                    });
+                        })
+                        .onFailure().recoverWithItem(e -> {
+                            logger.error("💥 Failed to update saldo withdraw for card_number={}", request.getCardNumber(), e);
+                            return new ApiResponse<>("error", e.getMessage(), null);
+                        }));
     }
 }

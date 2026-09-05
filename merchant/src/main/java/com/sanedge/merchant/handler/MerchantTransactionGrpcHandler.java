@@ -26,7 +26,7 @@ public class MerchantTransactionGrpcHandler extends MutinyMerchantTransactionSer
 
     @Override
     public Uni<ApiResponsePaginationMerchantTransaction> findAllTransactionMerchant(FindAllMerchantTransaction request) {
-        com.sanedge.merchant.domain.requests.FindAllMerchants domainReq = new com.sanedge.merchant.domain.requests.FindAllMerchants();
+        com.sanedge.merchant.domain.requests.transactions.FindAllMerchantTransactions domainReq = new com.sanedge.merchant.domain.requests.transactions.FindAllMerchantTransactions();
         domainReq.setPage(request.getPage());
         domainReq.setPageSize(request.getPageSize());
         domainReq.setSearch(request.getSearch());

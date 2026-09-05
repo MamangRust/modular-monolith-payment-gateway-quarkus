@@ -12,6 +12,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sanedge.common.config.RedisService;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.topup.domain.requests.stats.MonthTopupStatus;
 import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.topup.domain.response.stats.status.TopupResponseMonthStatusFailed;
@@ -21,16 +22,7 @@ import com.sanedge.topup.domain.response.stats.status.TopupResponseYearStatusSuc
 import com.sanedge.topup.repository.stats.TopupStatusRepository;
 import com.sanedge.topup.service.stats.status.TopupStatusService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -42,10 +34,7 @@ public class TopupStatusServiceImpl implements TopupStatusService {
     private final TopupStatusRepository topupStatusRepository;
     private final RedisService redisService;
     private final ObjectMapper objectMapper;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
@@ -53,20 +42,11 @@ public class TopupStatusServiceImpl implements TopupStatusService {
     public TopupStatusServiceImpl(TopupStatusRepository topupStatusRepository,
                                  RedisService redisService,
                                  ObjectMapper objectMapper,
-                                 OpenTelemetry openTelemetry) {
+                                 TracingMetrics tracingMetrics) {
         this.topupStatusRepository = topupStatusRepository;
         this.redisService = redisService;
         this.objectMapper = objectMapper;
-        this.tracer = openTelemetry.getTracer("topup-status-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("topup-status-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     private String toJson(Object obj) {
@@ -119,63 +99,45 @@ public class TopupStatusServiceImpl implements TopupStatusService {
 
         String cacheKey = String.format("topups:stats:month:success:%d:%d", year, month);
 
-        return redisService.getReactive(cacheKey)
-                .chain(cachedJson -> {
-                    if (cachedJson != null) {
-                        logger.info("Cache HIT for key: {}", cacheKey);
-                        List<TopupResponseMonthStatusSuccess> cached = fromJson(cachedJson,
-                                new TypeReference<List<TopupResponseMonthStatusSuccess>>() {
-                                });
-                        return Uni.createFrom().item(ApiResponse.success("Successfully fetched monthly SUCCESS topup status", cached));
-                    }
+        return tracingMetrics.traceAndMeasure("findMonthStatusSuccess", "find_month_status_success",
+                Attributes.builder()
+                        .put("service.name", "topup-status-service")
+                        .put("operation", "find_month_status_success")
+                        .put("year", String.valueOf(year))
+                        .put("month", String.valueOf(month))
+                        .build(), () -> {
+                    return redisService.getReactive(cacheKey)
+                            .chain(cachedJson -> {
+                                if (cachedJson != null) {
+                                    logger.info("Cache HIT for key: {}", cacheKey);
+                                    List<TopupResponseMonthStatusSuccess> cached = fromJson(cachedJson,
+                                            new TypeReference<List<TopupResponseMonthStatusSuccess>>() {
+                                            });
+                                    return Uni.createFrom()
+                                            .item(ApiResponse.success("Successfully fetched monthly SUCCESS topup status", cached));
+                                }
 
-                    logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findMonthStatusSuccess")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "topup-status-service")
-                            .setAttribute("operation", "find_month_status_success")
-                            .setAttribute("year", String.valueOf(year))
-                            .setAttribute("month", String.valueOf(month))
-                            .startSpan();
+                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
+                                LocalDate currentMonth = LocalDate.of(year.intValue(), month, 1);
+                                LocalDate nextMonth = currentMonth.plusMonths(1);
 
-                    LocalDate currentMonth = LocalDate.of(year.intValue(), month, 1);
-                    LocalDate nextMonth = currentMonth.plusMonths(1);
+                                return topupStatusRepository
+                                        .findMonthTopupStatusSuccess(year, month, (long) nextMonth.getYear(), nextMonth.getMonthValue())
+                                        .chain(data -> {
+                                            List<TopupResponseMonthStatusSuccess> responseList = data.stream()
+                                                    .map(TopupResponseMonthStatusSuccess::from)
+                                                    .collect(Collectors.toList());
 
-                    return topupStatusRepository.findMonthTopupStatusSuccess(year, month, (long) nextMonth.getYear(), nextMonth.getMonthValue())
-                            .chain(data -> {
-                                List<TopupResponseMonthStatusSuccess> responseList = data.stream()
-                                        .map(TopupResponseMonthStatusSuccess::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(responseList), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_month_status_success",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Successfully fetched monthly SUCCESS topup status", responseList);
+                                            return redisService.setWithExpirationReactive(cacheKey, toJson(responseList),
+                                                    STATS_CACHE_TTL_SECONDS)
+                                                    .map(v -> ApiResponse.success(
+                                                            "Successfully fetched monthly SUCCESS topup status", responseList));
                                         });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch monthly SUCCESS topup status month={} year={}", month, year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_status_success",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch monthly SUCCESS topup status", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_status_success"));
                             });
+                }).onFailure().recoverWithItem(e -> {
+                    logger.error("💥 Failed to fetch monthly SUCCESS topup status month={} year={}", month, year, e);
+                    return new ApiResponse<>("error", "Failed to fetch monthly SUCCESS topup status",
+                            Collections.emptyList());
                 });
     }
 
@@ -191,59 +153,40 @@ public class TopupStatusServiceImpl implements TopupStatusService {
 
         String cacheKey = String.format("topups:stats:year:success:%d", year);
 
-        return redisService.getReactive(cacheKey)
-                .chain(cachedJson -> {
-                    if (cachedJson != null) {
-                        logger.info("Cache HIT for key: {}", cacheKey);
-                        List<TopupResponseYearStatusSuccess> cached = fromJson(cachedJson,
-                                new TypeReference<List<TopupResponseYearStatusSuccess>>() {
-                                });
-                        return Uni.createFrom().item(ApiResponse.success("Successfully fetched yearly SUCCESS topup status", cached));
-                    }
+        return tracingMetrics.traceAndMeasure("findYearlyStatusSuccess", "find_yearly_status_success",
+                Attributes.builder()
+                        .put("service.name", "topup-status-service")
+                        .put("operation", "find_yearly_status_success")
+                        .put("year", String.valueOf(year))
+                        .build(), () -> {
+                    return redisService.getReactive(cacheKey)
+                            .chain(cachedJson -> {
+                                if (cachedJson != null) {
+                                    logger.info("Cache HIT for key: {}", cacheKey);
+                                    List<TopupResponseYearStatusSuccess> cached = fromJson(cachedJson,
+                                            new TypeReference<List<TopupResponseYearStatusSuccess>>() {
+                                            });
+                                    return Uni.createFrom()
+                                            .item(ApiResponse.success("Successfully fetched yearly SUCCESS topup status", cached));
+                                }
 
-                    logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findYearlyStatusSuccess")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "topup-status-service")
-                            .setAttribute("operation", "find_yearly_status_success")
-                            .setAttribute("year", String.valueOf(year))
-                            .startSpan();
+                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
+                                return topupStatusRepository.findYearlyTopupStatusSuccess(year)
+                                        .chain(data -> {
+                                            List<TopupResponseYearStatusSuccess> responseList = data.stream()
+                                                    .map(TopupResponseYearStatusSuccess::from)
+                                                    .collect(Collectors.toList());
 
-                    return topupStatusRepository.findYearlyTopupStatusSuccess(year)
-                            .chain(data -> {
-                                List<TopupResponseYearStatusSuccess> responseList = data.stream()
-                                        .map(TopupResponseYearStatusSuccess::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(responseList), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_yearly_status_success",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Successfully fetched yearly SUCCESS topup status", responseList);
+                                            return redisService.setWithExpirationReactive(cacheKey, toJson(responseList),
+                                                    STATS_CACHE_TTL_SECONDS)
+                                                    .map(v -> ApiResponse.success(
+                                                            "Successfully fetched yearly SUCCESS topup status", responseList));
                                         });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch yearly SUCCESS topup status year={}", year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_status_success",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch yearly SUCCESS topup status", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_status_success"));
                             });
+                }).onFailure().recoverWithItem(e -> {
+                    logger.error("💥 Failed to fetch yearly SUCCESS topup status year={}", year, e);
+                    return new ApiResponse<>("error", "Failed to fetch yearly SUCCESS topup status",
+                            Collections.emptyList());
                 });
     }
 
@@ -261,63 +204,45 @@ public class TopupStatusServiceImpl implements TopupStatusService {
 
         String cacheKey = String.format("topups:stats:month:failed:%d:%d", year, month);
 
-        return redisService.getReactive(cacheKey)
-                .chain(cachedJson -> {
-                    if (cachedJson != null) {
-                        logger.info("Cache HIT for key: {}", cacheKey);
-                        List<TopupResponseMonthStatusFailed> cached = fromJson(cachedJson,
-                                new TypeReference<List<TopupResponseMonthStatusFailed>>() {
-                                });
-                        return Uni.createFrom().item(ApiResponse.success("Successfully fetched monthly FAILED topup status", cached));
-                    }
+        return tracingMetrics.traceAndMeasure("findMonthStatusFailed", "find_month_status_failed",
+                Attributes.builder()
+                        .put("service.name", "topup-status-service")
+                        .put("operation", "find_month_status_failed")
+                        .put("year", String.valueOf(year))
+                        .put("month", String.valueOf(month))
+                        .build(), () -> {
+                    return redisService.getReactive(cacheKey)
+                            .chain(cachedJson -> {
+                                if (cachedJson != null) {
+                                    logger.info("Cache HIT for key: {}", cacheKey);
+                                    List<TopupResponseMonthStatusFailed> cached = fromJson(cachedJson,
+                                            new TypeReference<List<TopupResponseMonthStatusFailed>>() {
+                                            });
+                                    return Uni.createFrom()
+                                            .item(ApiResponse.success("Successfully fetched monthly FAILED topup status", cached));
+                                }
 
-                    logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findMonthStatusFailed")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "topup-status-service")
-                            .setAttribute("operation", "find_month_status_failed")
-                            .setAttribute("year", String.valueOf(year))
-                            .setAttribute("month", String.valueOf(month))
-                            .startSpan();
+                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
+                                LocalDate currentMonth = LocalDate.of(year.intValue(), month, 1);
+                                LocalDate nextMonth = currentMonth.plusMonths(1);
 
-                    LocalDate currentMonth = LocalDate.of(year.intValue(), month, 1);
-                    LocalDate nextMonth = currentMonth.plusMonths(1);
+                                return topupStatusRepository
+                                        .findMonthTopupStatusFailed(year, month, (long) nextMonth.getYear(), nextMonth.getMonthValue())
+                                        .chain(data -> {
+                                            List<TopupResponseMonthStatusFailed> responseList = data.stream()
+                                                    .map(TopupResponseMonthStatusFailed::from)
+                                                    .collect(Collectors.toList());
 
-                    return topupStatusRepository.findMonthTopupStatusFailed(year, month, (long) nextMonth.getYear(), nextMonth.getMonthValue())
-                            .chain(data -> {
-                                List<TopupResponseMonthStatusFailed> responseList = data.stream()
-                                        .map(TopupResponseMonthStatusFailed::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(responseList), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_month_status_failed",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Successfully fetched monthly FAILED topup status", responseList);
+                                            return redisService.setWithExpirationReactive(cacheKey, toJson(responseList),
+                                                    STATS_CACHE_TTL_SECONDS)
+                                                    .map(v -> ApiResponse.success(
+                                                            "Successfully fetched monthly FAILED topup status", responseList));
                                         });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch monthly FAILED topup status month={} year={}", month, year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_status_failed",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch monthly FAILED topup status", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_month_status_failed"));
                             });
+                }).onFailure().recoverWithItem(e -> {
+                    logger.error("💥 Failed to fetch monthly FAILED topup status month={} year={}", month, year, e);
+                    return new ApiResponse<>("error", "Failed to fetch monthly FAILED topup status",
+                            Collections.emptyList());
                 });
     }
 
@@ -333,59 +258,40 @@ public class TopupStatusServiceImpl implements TopupStatusService {
 
         String cacheKey = String.format("topups:stats:year:failed:%d", year);
 
-        return redisService.getReactive(cacheKey)
-                .chain(cachedJson -> {
-                    if (cachedJson != null) {
-                        logger.info("Cache HIT for key: {}", cacheKey);
-                        List<TopupResponseYearStatusFailed> cached = fromJson(cachedJson,
-                                new TypeReference<List<TopupResponseYearStatusFailed>>() {
-                                });
-                        return Uni.createFrom().item(ApiResponse.success("Successfully fetched yearly FAILED topup status", cached));
-                    }
+        return tracingMetrics.traceAndMeasure("findYearlyStatusFailed", "find_yearly_status_failed",
+                Attributes.builder()
+                        .put("service.name", "topup-status-service")
+                        .put("operation", "find_yearly_status_failed")
+                        .put("year", String.valueOf(year))
+                        .build(), () -> {
+                    return redisService.getReactive(cacheKey)
+                            .chain(cachedJson -> {
+                                if (cachedJson != null) {
+                                    logger.info("Cache HIT for key: {}", cacheKey);
+                                    List<TopupResponseYearStatusFailed> cached = fromJson(cachedJson,
+                                            new TypeReference<List<TopupResponseYearStatusFailed>>() {
+                                            });
+                                    return Uni.createFrom()
+                                            .item(ApiResponse.success("Successfully fetched yearly FAILED topup status", cached));
+                                }
 
-                    logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findYearlyStatusFailed")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "topup-status-service")
-                            .setAttribute("operation", "find_yearly_status_failed")
-                            .setAttribute("year", String.valueOf(year))
-                            .startSpan();
+                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
+                                return topupStatusRepository.findYearlyTopupStatusFailed(year)
+                                        .chain(data -> {
+                                            List<TopupResponseYearStatusFailed> responseList = data.stream()
+                                                    .map(TopupResponseYearStatusFailed::from)
+                                                    .collect(Collectors.toList());
 
-                    return topupStatusRepository.findYearlyTopupStatusFailed(year)
-                            .chain(data -> {
-                                List<TopupResponseYearStatusFailed> responseList = data.stream()
-                                        .map(TopupResponseYearStatusFailed::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(responseList), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_yearly_status_failed",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Successfully fetched yearly FAILED topup status", responseList);
+                                            return redisService.setWithExpirationReactive(cacheKey, toJson(responseList),
+                                                    STATS_CACHE_TTL_SECONDS)
+                                                    .map(v -> ApiResponse.success(
+                                                            "Successfully fetched yearly FAILED topup status", responseList));
                                         });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch yearly FAILED topup status year={}", year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_status_failed",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch yearly FAILED topup status", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_status_failed"));
                             });
+                }).onFailure().recoverWithItem(e -> {
+                    logger.error("💥 Failed to fetch yearly FAILED topup status year={}", year, e);
+                    return new ApiResponse<>("error", "Failed to fetch yearly FAILED topup status",
+                            Collections.emptyList());
                 });
     }
 }

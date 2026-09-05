@@ -17,6 +17,7 @@ import com.sanedge.topup.domain.response.stats.method.TopupYearlyMethodResponse;
 import com.sanedge.topup.repository.stats.TopupMethodRepository;
 import com.sanedge.topup.service.stats.method.TopupMethodService;
 
+import com.sanedge.common.observability.TracingMetrics;
 import io.opentelemetry.api.OpenTelemetry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
@@ -45,7 +46,14 @@ public class TopupMethodServiceImpl implements TopupMethodService {
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
-    @Inject
+        public TopupMethodServiceImpl(TopupMethodRepository topupMethodRepository,
+            RedisService redisService,
+            ObjectMapper objectMapper,
+            TracingMetrics tracingMetrics) {
+        this(topupMethodRepository, redisService, objectMapper, OpenTelemetry.noop());
+    }
+
+@Inject
     public TopupMethodServiceImpl(TopupMethodRepository topupMethodRepository,
                                   RedisService redisService,
                                   ObjectMapper objectMapper,

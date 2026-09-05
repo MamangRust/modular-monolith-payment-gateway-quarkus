@@ -1,6 +1,6 @@
 package com.sanedge.card.entity;
 
-import java.sql.Timestamp;
+import java.time.Instant;
 
 import io.quarkus.hibernate.reactive.panache.PanacheEntityBase;
 import jakarta.persistence.Column;
@@ -15,23 +15,23 @@ import lombok.Setter;
 @MappedSuperclass
 public class BaseModel extends PanacheEntityBase {
     @Column(name = "created_at")
-    private Timestamp createdAt;
+    private Instant createdAt;
 
     @Column(name = "updated_at")
-    private Timestamp updatedAt;
+    private Instant updatedAt;
 
     @Column(name = "deleted_at")
-    private Timestamp deletedAt;
+    private Instant deletedAt;
 
     @PrePersist
     protected void onCreate() {
-        Timestamp now = new Timestamp(System.currentTimeMillis());
+        Instant now = Instant.now();
         this.createdAt = now;
         this.updatedAt = now;
     }
 
     @PreUpdate
     protected void onUpdate() {
-        this.updatedAt = new Timestamp(System.currentTimeMillis());
+        this.updatedAt = Instant.now();
     }
 }

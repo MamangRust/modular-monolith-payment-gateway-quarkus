@@ -17,12 +17,51 @@ public class TransactionMonthMethodResponse {
     private Long totalTransactions;
     private Long totalAmount;
 
+    public TransactionMonthMethodResponse(String monthName, String paymentMethod, long totalTransactions, long totalAmount) {
+        this.monthName = monthName;
+        this.paymentMethod = paymentMethod;
+        this.totalTransactions = totalTransactions;
+        this.totalAmount = totalAmount;
+    }
+
+    public String getMonthName() {
+        return monthName;
+    }
+
+    public void setMonthName(String monthName) {
+        this.monthName = monthName;
+    }
+
+    public String getPaymentMethod() {
+        return paymentMethod;
+    }
+
+    public void setPaymentMethod(String paymentMethod) {
+        this.paymentMethod = paymentMethod;
+    }
+
+    public Long getTotalTransactions() {
+        return totalTransactions;
+    }
+
+    public void setTotalTransactions(Long totalTransactions) {
+        this.totalTransactions = totalTransactions;
+    }
+
+    public Long getTotalAmount() {
+        return totalAmount;
+    }
+
+    public void setTotalAmount(Long totalAmount) {
+        this.totalAmount = totalAmount;
+    }
+
     public static TransactionMonthMethodResponse from(TransactionMonthMethod dto) {
-        return TransactionMonthMethodResponse.builder()
-                .monthName(dto.getMonth())
-                .paymentMethod(dto.getPaymentMethod())
-                .totalTransactions(dto.getTotalTransactions().longValue())
-                .totalAmount(dto.getTotalAmount().longValue())
-                .build();
+        return new TransactionMonthMethodResponse(
+            dto.getMonth(),
+            dto.getPaymentMethod(),
+            dto.getTotalTransactions(),
+            dto.getTotalAmount()
+        );
     }
 }

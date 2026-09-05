@@ -1,7 +1,7 @@
 package com.sanedge.card.repository;
 
-import java.sql.Timestamp;
-import java.time.LocalDateTime;
+import java.math.BigDecimal;
+import java.time.Instant;
 
 import com.sanedge.card.entity.Card;
 
@@ -18,8 +18,7 @@ public class CardCommandRepository implements PanacheRepository<Card> {
         return find("cardId = ?1 AND deletedAt IS NULL", cardId).firstResult()
                 .chain(card -> {
                     if (card != null) {
-                        LocalDateTime date = LocalDateTime.now();
-                        card.setDeletedAt(Timestamp.valueOf(date));
+                        card.setDeletedAt(Instant.now());
                         return persist(card).map(v -> card);
                     }
                     return Uni.createFrom().nullItem();
@@ -39,13 +38,13 @@ public class CardCommandRepository implements PanacheRepository<Card> {
     }
 
     @WithTransaction
-    public Uni<Boolean> deletePermanent(Long cardId) {
-        return find("cardId = ?1", cardId).firstResult()
+    public Uni<Card> deletePermanent(Long cardId) {
+        return find("cardId = ?1 AND deletedAt IS NOT NULL", cardId).firstResult()
                 .chain(card -> {
                     if (card != null) {
-                        return delete(card).map(v -> true);
+                        return delete(card).map(v -> card);
                     }
-                    return Uni.createFrom().item(false);
+                    return Uni.createFrom().nullItem();
                 });
     }
 
@@ -59,5 +58,51 @@ public class CardCommandRepository implements PanacheRepository<Card> {
     public Uni<Boolean> deleteAllDeleted() {
         return delete("deletedAt IS NOT NULL")
                 .map(deletedCount -> deletedCount > 0);
+    }
+
+    @WithTransaction
+    public Uni<Card> toggleStatus(Long cardId) {
+        return find("cardId = ?1", cardId).firstResult()
+                .chain(card -> {
+                    if (card != null) {
+                        if (card.status == Card.CardStatus.ACTIVE) {
+                            card.status = Card.CardStatus.SUSPENDED;
+                        } else if (card.status == Card.CardStatus.SUSPENDED) {
+                            card.status = Card.CardStatus.ACTIVE;
+                        } else {
+                            return Uni.createFrom().nullItem();
+                        }
+                        return persist(card).map(v -> card);
+                    }
+                    return Uni.createFrom().nullItem();
+                });
+    }
+
+    @WithTransaction
+    public Uni<Card> updateCreditLimit(Long cardId, BigDecimal newLimit) {
+        return find("cardId = ?1 AND deletedAt IS NULL", cardId).firstResult()
+                .chain(card -> {
+                    if (card != null) {
+                        card.setCreditLimit(newLimit);
+                        return persist(card).map(v -> card);
+                    }
+                    return Uni.createFrom().nullItem();
+                });
+    }
+
+    @WithTransaction
+    public Uni<Card> redeemPoints(Long cardId, BigDecimal points) {
+        return find("cardId = ?1 AND deletedAt IS NULL", cardId).firstResult()
+                .chain(card -> {
+                    if (card == null) {
+                        return Uni.createFrom().nullItem();
+                    }
+                    BigDecimal available = card.getPoints() != null ? card.getPoints() : BigDecimal.ZERO;
+                    if (available.compareTo(points) < 0) {
+                        return Uni.createFrom().nullItem();
+                    }
+                    card.setPoints(available.subtract(points));
+                    return persist(card).map(v -> card);
+                });
     }
 }

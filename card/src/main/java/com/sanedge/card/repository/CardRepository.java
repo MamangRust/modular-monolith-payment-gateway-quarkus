@@ -1,7 +1,6 @@
 package com.sanedge.card.repository;
 
-import java.sql.Timestamp;
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 import com.sanedge.common.domain.response.PagedResult;
 import com.sanedge.card.entity.Card;
@@ -91,8 +90,7 @@ public class CardRepository implements PanacheRepository<Card> {
         return find("cardId = ?1 AND deletedAt IS NULL", cardId).firstResult()
                 .chain(card -> {
                     if (card != null) {
-                        LocalDateTime date = LocalDateTime.now();
-                        card.setDeletedAt(Timestamp.valueOf(date));
+                        card.setDeletedAt(Instant.now());
                         return persist(card).map(v -> card);
                     }
                     return Uni.createFrom().nullItem();

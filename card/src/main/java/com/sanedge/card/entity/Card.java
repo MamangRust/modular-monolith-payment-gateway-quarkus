@@ -1,11 +1,14 @@
 package com.sanedge.card.entity;
 
+import java.math.BigDecimal;
 import java.sql.Date;
 
 import com.sanedge.card.entity.BaseModel;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
@@ -45,4 +48,18 @@ public class Card extends BaseModel {
 
     @Column(name = "card_provider", nullable = false)
     public String cardProvider;
+
+    @Column(name = "credit_limit", precision = 19, scale = 2)
+    public BigDecimal creditLimit = BigDecimal.ZERO;
+
+    @Column(name = "points", precision = 19, scale = 2)
+    public BigDecimal points = BigDecimal.ZERO;
+
+    @Column(name = "status")
+    @Enumerated(EnumType.STRING)
+    public CardStatus status;
+
+    public enum CardStatus {
+        ACTIVE, SUSPENDED, BLOCKED, FROZEN
+    }
 }

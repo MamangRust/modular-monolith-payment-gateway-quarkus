@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.common.config.RedisService;
 import com.sanedge.transaction.domain.requests.FindAllTransactionCardNumber;
 import com.sanedge.transaction.domain.requests.FindAllTransactions;
@@ -50,7 +51,14 @@ public class TransactionQueryServiceImpl implements TransactionQueryService {
 
     private static final long QUERY_CACHE_TTL_SECONDS = 300;
 
-    @Inject
+        public TransactionQueryServiceImpl(TransactionQueryRepository transactionQueryRepository,
+            RedisService redisService,
+            ObjectMapper objectMapper,
+            TracingMetrics tracingMetrics) {
+        this(transactionQueryRepository, redisService, objectMapper, OpenTelemetry.noop());
+    }
+
+@Inject
     public TransactionQueryServiceImpl(TransactionQueryRepository transactionQueryRepository,
                                        RedisService redisService,
                                        ObjectMapper objectMapper,
@@ -119,7 +127,7 @@ public class TransactionQueryServiceImpl implements TransactionQueryService {
                             .setAttribute("size", String.valueOf(pageSize))
                             .startSpan();
 
-                    return transactionQueryRepository.findTransactions(search, page, pageSize)
+                    return transactionQueryRepository.findTransactions(req)
                             .chain(pagedResult -> {
                                 List<TransactionResponse> data = pagedResult.getData().stream()
                                         .map(TransactionResponse::from)
@@ -217,7 +225,7 @@ public class TransactionQueryServiceImpl implements TransactionQueryService {
                             .setAttribute("size", String.valueOf(pageSize))
                             .startSpan();
 
-                    return transactionQueryRepository.findTransactionsByCardNumber(cardNumber, search, page, pageSize)
+                    return transactionQueryRepository.findTransactionsByCardNumber(req)
                             .chain(pagedResult -> {
                                 List<TransactionResponse> data = pagedResult.getData().stream()
                                         .map(TransactionResponse::from)
@@ -303,7 +311,7 @@ public class TransactionQueryServiceImpl implements TransactionQueryService {
                             .setAttribute("size", String.valueOf(pageSize))
                             .startSpan();
 
-                    return transactionQueryRepository.findActiveTransactions(search, page, pageSize)
+                    return transactionQueryRepository.findActiveTransactions(req)
                             .chain(pagedResult -> {
                                 List<TransactionResponseDeleteAt> data = pagedResult.getData().stream()
                                         .map(TransactionResponseDeleteAt::from)
@@ -389,7 +397,7 @@ public class TransactionQueryServiceImpl implements TransactionQueryService {
                             .setAttribute("size", String.valueOf(pageSize))
                             .startSpan();
 
-                    return transactionQueryRepository.findTrashedTransactions(search, page, pageSize)
+                    return transactionQueryRepository.findTrashedTransactions(req)
                             .chain(pagedResult -> {
                                 List<TransactionResponseDeleteAt> data = pagedResult.getData().stream()
                                         .map(TransactionResponseDeleteAt::from)

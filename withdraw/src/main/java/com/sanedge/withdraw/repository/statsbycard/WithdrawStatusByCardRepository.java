@@ -1,7 +1,9 @@
 package com.sanedge.withdraw.repository.statsbycard;
 
+import java.time.LocalDate;
 import java.util.List;
 
+import com.sanedge.withdraw.domain.requests.statsbycard.MonthStatusWithdrawCardNumber;
 import com.sanedge.withdraw.entity.Withdraw;
 import com.sanedge.withdraw.entity.WithdrawMonthStatusFailed;
 import com.sanedge.withdraw.entity.WithdrawMonthStatusSuccess;
@@ -14,6 +16,15 @@ import jakarta.enterprise.context.ApplicationScoped;
 
 @ApplicationScoped
 public class WithdrawStatusByCardRepository implements PanacheRepository<Withdraw> {
+
+    public Uni<List<WithdrawMonthStatusSuccess>> findMonthWithdrawStatusSuccessByCard(
+            MonthStatusWithdrawCardNumber req) {
+        LocalDate currentMonth = LocalDate.of(req.getYear(), req.getMonth(), 1);
+        LocalDate nextMonth = currentMonth.plusMonths(1);
+        return findMonthWithdrawStatusSuccessByCard(
+                req.getCardNumber(), (long) req.getYear(), req.getMonth(),
+                (long) nextMonth.getYear(), nextMonth.getMonthValue());
+    }
 
     public Uni<List<WithdrawMonthStatusSuccess>> findMonthWithdrawStatusSuccessByCard(
             String cardNumber, Long startYear, Integer startMonth, Long endYear, Integer endMonth) {
@@ -61,6 +72,15 @@ public class WithdrawStatusByCardRepository implements PanacheRepository<Withdra
                     .toList()
                 )
         );
+    }
+
+    public Uni<List<WithdrawMonthStatusFailed>> findMonthWithdrawStatusFailedByCard(
+            MonthStatusWithdrawCardNumber req) {
+        LocalDate currentMonth = LocalDate.of(req.getYear(), req.getMonth(), 1);
+        LocalDate nextMonth = currentMonth.plusMonths(1);
+        return findMonthWithdrawStatusFailedByCard(
+                req.getCardNumber(), (long) req.getYear(), req.getMonth(),
+                (long) nextMonth.getYear(), nextMonth.getMonthValue());
     }
 
     public Uni<List<WithdrawMonthStatusFailed>> findMonthWithdrawStatusFailedByCard(

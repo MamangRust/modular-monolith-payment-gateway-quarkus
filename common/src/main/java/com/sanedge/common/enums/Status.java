@@ -8,7 +8,9 @@ import lombok.Getter;
 public enum Status {
     PENDING("pending"),
     SUCCESS("success"),
-    FAILED("failed");
+    FAILED("failed"),
+    COMPENSATION_REQUIRED("compensation_required"),
+    COMPENSATED("compensated");
 
     private final String value;
 }

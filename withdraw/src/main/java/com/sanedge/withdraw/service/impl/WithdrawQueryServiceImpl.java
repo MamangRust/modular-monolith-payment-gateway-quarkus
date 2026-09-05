@@ -15,6 +15,7 @@ import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.common.domain.response.ApiResponsePagination;
 import com.sanedge.common.domain.response.PaginationMeta;
 import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.withdraw.domain.requests.FindAllWithdrawCardNumber;
 import com.sanedge.withdraw.domain.requests.FindAllWithdraws;
 import com.sanedge.withdraw.domain.response.WithdrawResponse;
@@ -22,16 +23,7 @@ import com.sanedge.withdraw.domain.response.WithdrawResponseDeleteAt;
 import com.sanedge.withdraw.repository.WithdrawQueryRepository;
 import com.sanedge.withdraw.service.WithdrawQueryService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -43,10 +35,7 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
     private final WithdrawQueryRepository withdrawQueryRepository;
     private final RedisService redisService;
     private final ObjectMapper objectMapper;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     private static final long QUERY_CACHE_TTL_SECONDS = 300;
 
@@ -54,20 +43,11 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
     public WithdrawQueryServiceImpl(WithdrawQueryRepository withdrawQueryRepository,
                                     RedisService redisService,
                                     ObjectMapper objectMapper,
-                                    OpenTelemetry openTelemetry) {
+                                    TracingMetrics tracingMetrics) {
         this.withdrawQueryRepository = withdrawQueryRepository;
         this.redisService = redisService;
         this.objectMapper = objectMapper;
-        this.tracer = openTelemetry.getTracer("withdraw-query-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("withdraw-query-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     private String toJson(Object obj) {
@@ -99,6 +79,12 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
 
         String cacheKey = String.format("withdraws:all:%d:%d:%s", page, pageSize, search);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_all")
+                .put("page", page)
+                .put("size", pageSize)
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -110,68 +96,39 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findAllWithdraws")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "withdraw-query-service")
-                            .setAttribute("operation", "find_all")
-                            .setAttribute("page", String.valueOf(page))
-                            .setAttribute("size", String.valueOf(pageSize))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findAllWithdraws", "find_all", attrs,
+                            () -> withdrawQueryRepository.findAllWithdraws(req)
+                                    .chain(pagedResult -> {
+                                        List<WithdrawResponse> data = pagedResult.getData().stream()
+                                                .map(WithdrawResponse::from)
+                                                .collect(Collectors.toList());
 
-                    return withdrawQueryRepository.findAllWithdraws(search, page, pageSize)
-                            .chain(pagedResult -> {
-                                List<WithdrawResponse> data = pagedResult.getData().stream()
-                                        .map(WithdrawResponse::from)
-                                        .collect(Collectors.toList());
+                                        PaginationMeta meta = new PaginationMeta(
+                                                pagedResult.getTotalRecords(),
+                                                page + 1,
+                                                pageSize,
+                                                (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
+                                        );
 
-                                PaginationMeta meta = new PaginationMeta(
-                                        pagedResult.getTotalRecords(),
-                                        page + 1,
-                                        pageSize,
-                                        (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
-                                );
+                                        ApiResponsePagination<List<WithdrawResponse>> response = new ApiResponsePagination<>(
+                                                "success",
+                                                "Withdraws retrieved successfully",
+                                                data,
+                                                meta
+                                        );
 
-                                ApiResponsePagination<List<WithdrawResponse>> response = new ApiResponsePagination<>(
-                                        "success",
-                                        "Withdraws retrieved successfully",
-                                        data,
-                                        meta
-                                );
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_all",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return response;
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch all withdraws", e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_all",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponsePagination<>(
-                                        "error",
-                                        "Failed to fetch withdraws",
-                                        Collections.emptyList(),
-                                        null
-                                );
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_all"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> response);
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch all withdraws", e);
+                                        return new ApiResponsePagination<>(
+                                                "error",
+                                                "Failed to fetch withdraws",
+                                                Collections.emptyList(),
+                                                null
+                                        );
+                                    }));
                 });
     }
 
@@ -187,6 +144,13 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
 
         String cacheKey = String.format("withdraws:card:%s:%d:%d:%s", cardNumber, page, pageSize, search);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_all_by_card_number")
+                .put("cardNumber", cardNumber)
+                .put("page", page)
+                .put("size", pageSize)
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -198,69 +162,39 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findAllWithdrawsByCardNumber")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "withdraw-query-service")
-                            .setAttribute("operation", "find_all_by_card_number")
-                            .setAttribute("cardNumber", cardNumber)
-                            .setAttribute("page", String.valueOf(page))
-                            .setAttribute("size", String.valueOf(pageSize))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findAllWithdrawsByCardNumber", "find_all_by_card_number", attrs,
+                            () -> withdrawQueryRepository.findAllByCardNumber(req)
+                                    .chain(pagedResult -> {
+                                        List<WithdrawResponse> data = pagedResult.getData().stream()
+                                                .map(WithdrawResponse::from)
+                                                .collect(Collectors.toList());
 
-                    return withdrawQueryRepository.findAllByCardNumber(cardNumber, search, page, pageSize)
-                            .chain(pagedResult -> {
-                                List<WithdrawResponse> data = pagedResult.getData().stream()
-                                        .map(WithdrawResponse::from)
-                                        .collect(Collectors.toList());
+                                        PaginationMeta meta = new PaginationMeta(
+                                                pagedResult.getTotalRecords(),
+                                                page + 1,
+                                                pageSize,
+                                                (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
+                                        );
 
-                                PaginationMeta meta = new PaginationMeta(
-                                        pagedResult.getTotalRecords(),
-                                        page + 1,
-                                        pageSize,
-                                        (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
-                                );
+                                        ApiResponsePagination<List<WithdrawResponse>> response = new ApiResponsePagination<>(
+                                                "success",
+                                                "Withdraws by card number retrieved successfully",
+                                                data,
+                                                meta
+                                        );
 
-                                ApiResponsePagination<List<WithdrawResponse>> response = new ApiResponsePagination<>(
-                                        "success",
-                                        "Withdraws by card number retrieved successfully",
-                                        data,
-                                        meta
-                                );
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_all_by_card_number",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return response;
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch withdraws by card number={}", cardNumber, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_all_by_card_number",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponsePagination<>(
-                                        "error",
-                                        "Failed to fetch withdraws by card number",
-                                        Collections.emptyList(),
-                                        null
-                                );
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_all_by_card_number"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> response);
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch withdraws by card number={}", cardNumber, e);
+                                        return new ApiResponsePagination<>(
+                                                "error",
+                                                "Failed to fetch withdraws by card number",
+                                                Collections.emptyList(),
+                                                null
+                                        );
+                                    }));
                 });
     }
 
@@ -269,6 +203,11 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
         logger.info("🔍 Finding withdraw by id={}", withdrawId);
 
         String cacheKey = String.format("withdraws:id:%d", withdrawId);
+
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_by_id")
+                .put("withdrawId", String.valueOf(withdrawId))
+                .build();
 
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
@@ -279,50 +218,22 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findWithdrawById")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "withdraw-query-service")
-                            .setAttribute("operation", "find_by_id")
-                            .setAttribute("withdrawId", String.valueOf(withdrawId))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findWithdrawById", "find_by_id", attrs,
+                            () -> withdrawQueryRepository.findById(withdrawId)
+                                    .chain(w -> {
+                                        if (w == null) {
+                                            throw new ResourceNotFoundException("Withdraw not found with id " + withdrawId);
+                                        }
 
-                    return withdrawQueryRepository.findById(withdrawId)
-                            .chain(w -> {
-                                if (w == null) {
-                                    throw new ResourceNotFoundException("Withdraw not found with id " + withdrawId);
-                                }
+                                        WithdrawResponse response = WithdrawResponse.from(w);
 
-                                WithdrawResponse response = WithdrawResponse.from(w);
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_by_id",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Withdraw retrieved successfully", response);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch withdraw id={}", withdrawId, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_by_id",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Withdraw not found", null);
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_by_id"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success("Withdraw retrieved successfully", response));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch withdraw id={}", withdrawId, e);
+                                        return new ApiResponse<>("error", "Withdraw not found", null);
+                                    }));
                 });
     }
 
@@ -331,6 +242,11 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
         logger.info("💳 Finding withdraws list by card number={}", cardNumber);
 
         String cacheKey = String.format("withdraws:list:card:%s", cardNumber);
+
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_by_card")
+                .put("cardNumber", cardNumber)
+                .build();
 
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
@@ -341,48 +257,20 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findWithdrawsByCardNumberList")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "withdraw-query-service")
-                            .setAttribute("operation", "find_by_card")
-                            .setAttribute("cardNumber", cardNumber)
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findWithdrawsByCardNumberList", "find_by_card", attrs,
+                            () -> withdrawQueryRepository.findByCardNumber(cardNumber)
+                                    .chain(withdraws -> {
+                                        List<WithdrawResponse> data = withdraws.stream()
+                                                .map(WithdrawResponse::from)
+                                                .collect(Collectors.toList());
 
-                    return withdrawQueryRepository.findByCardNumber(cardNumber)
-                            .chain(withdraws -> {
-                                List<WithdrawResponse> data = withdraws.stream()
-                                        .map(WithdrawResponse::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(data), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_by_card",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Withdraws by card number retrieved successfully", data);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch withdraws by card number={}", cardNumber, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_by_card",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to fetch withdraws by card number", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_by_card"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(data), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success("Withdraws by card number retrieved successfully", data));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch withdraws by card number={}", cardNumber, e);
+                                        return new ApiResponse<>("error", "Failed to fetch withdraws by card number", Collections.emptyList());
+                                    }));
                 });
     }
 
@@ -396,6 +284,12 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
 
         String cacheKey = String.format("withdraws:active:%d:%d:%s", page, pageSize, search);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_active")
+                .put("page", page)
+                .put("size", pageSize)
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -407,68 +301,39 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findActiveWithdraws")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "withdraw-query-service")
-                            .setAttribute("operation", "find_active")
-                            .setAttribute("page", String.valueOf(page))
-                            .setAttribute("size", String.valueOf(pageSize))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findActiveWithdraws", "find_active", attrs,
+                            () -> withdrawQueryRepository.findActiveWithdraws(req)
+                                    .chain(pagedResult -> {
+                                        List<WithdrawResponseDeleteAt> data = pagedResult.getData().stream()
+                                                .map(WithdrawResponseDeleteAt::from)
+                                                .collect(Collectors.toList());
 
-                    return withdrawQueryRepository.findActiveWithdraws(search, page, pageSize)
-                            .chain(pagedResult -> {
-                                List<WithdrawResponseDeleteAt> data = pagedResult.getData().stream()
-                                        .map(WithdrawResponseDeleteAt::from)
-                                        .collect(Collectors.toList());
+                                        PaginationMeta meta = new PaginationMeta(
+                                                pagedResult.getTotalRecords(),
+                                                page + 1,
+                                                pageSize,
+                                                (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
+                                        );
 
-                                PaginationMeta meta = new PaginationMeta(
-                                        pagedResult.getTotalRecords(),
-                                        page + 1,
-                                        pageSize,
-                                        (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
-                                );
+                                        ApiResponsePagination<List<WithdrawResponseDeleteAt>> response = new ApiResponsePagination<>(
+                                                "success",
+                                                "Active withdraws retrieved successfully",
+                                                data,
+                                                meta
+                                        );
 
-                                ApiResponsePagination<List<WithdrawResponseDeleteAt>> response = new ApiResponsePagination<>(
-                                        "success",
-                                        "Active withdraws retrieved successfully",
-                                        data,
-                                        meta
-                                );
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_active",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return response;
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch active withdraws", e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_active",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponsePagination<>(
-                                        "error",
-                                        "Failed to fetch active withdraws",
-                                        Collections.emptyList(),
-                                        null
-                                );
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_active"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> response);
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch active withdraws", e);
+                                        return new ApiResponsePagination<>(
+                                                "error",
+                                                "Failed to fetch active withdraws",
+                                                Collections.emptyList(),
+                                                null
+                                        );
+                                    }));
                 });
     }
 
@@ -482,6 +347,12 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
 
         String cacheKey = String.format("withdraws:trashed:%d:%d:%s", page, pageSize, search);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_trashed")
+                .put("page", page)
+                .put("size", pageSize)
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -493,68 +364,39 @@ public class WithdrawQueryServiceImpl implements WithdrawQueryService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findTrashedWithdraws")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "withdraw-query-service")
-                            .setAttribute("operation", "find_trashed")
-                            .setAttribute("page", String.valueOf(page))
-                            .setAttribute("size", String.valueOf(pageSize))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findTrashedWithdraws", "find_trashed", attrs,
+                            () -> withdrawQueryRepository.findTrashedWithdraws(req)
+                                    .chain(pagedResult -> {
+                                        List<WithdrawResponseDeleteAt> data = pagedResult.getData().stream()
+                                                .map(WithdrawResponseDeleteAt::from)
+                                                .collect(Collectors.toList());
 
-                    return withdrawQueryRepository.findTrashedWithdraws(search, page, pageSize)
-                            .chain(pagedResult -> {
-                                List<WithdrawResponseDeleteAt> data = pagedResult.getData().stream()
-                                        .map(WithdrawResponseDeleteAt::from)
-                                        .collect(Collectors.toList());
+                                        PaginationMeta meta = new PaginationMeta(
+                                                pagedResult.getTotalRecords(),
+                                                page + 1,
+                                                pageSize,
+                                                (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
+                                        );
 
-                                PaginationMeta meta = new PaginationMeta(
-                                        pagedResult.getTotalRecords(),
-                                        page + 1,
-                                        pageSize,
-                                        (int) Math.ceil((double) pagedResult.getTotalRecords() / pageSize)
-                                );
+                                        ApiResponsePagination<List<WithdrawResponseDeleteAt>> response = new ApiResponsePagination<>(
+                                                "success",
+                                                "Trashed withdraws retrieved successfully",
+                                                data,
+                                                meta
+                                        );
 
-                                ApiResponsePagination<List<WithdrawResponseDeleteAt>> response = new ApiResponsePagination<>(
-                                        "success",
-                                        "Trashed withdraws retrieved successfully",
-                                        data,
-                                        meta
-                                );
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_trashed",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return response;
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("💥 Failed to fetch trashed withdraws", e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_trashed",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponsePagination<>(
-                                        "error",
-                                        "Failed to fetch trashed withdraws",
-                                        Collections.emptyList(),
-                                        null
-                                );
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_trashed"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), QUERY_CACHE_TTL_SECONDS)
+                                                .map(v -> response);
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("💥 Failed to fetch trashed withdraws", e);
+                                        return new ApiResponsePagination<>(
+                                                "error",
+                                                "Failed to fetch trashed withdraws",
+                                                Collections.emptyList(),
+                                                null
+                                        );
+                                    }));
                 });
     }
 }

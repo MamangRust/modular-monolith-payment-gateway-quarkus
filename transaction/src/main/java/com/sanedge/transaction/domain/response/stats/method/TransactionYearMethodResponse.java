@@ -17,12 +17,51 @@ public class TransactionYearMethodResponse {
     private Long totalTransactions;
     private Long totalAmount;
 
+    public TransactionYearMethodResponse(String reportYear, String paymentMethod, long totalTransactions, long totalAmount) {
+        this.reportYear = reportYear;
+        this.paymentMethod = paymentMethod;
+        this.totalTransactions = totalTransactions;
+        this.totalAmount = totalAmount;
+    }
+
+    public String getReportYear() {
+        return reportYear;
+    }
+
+    public void setReportYear(String reportYear) {
+        this.reportYear = reportYear;
+    }
+
+    public String getPaymentMethod() {
+        return paymentMethod;
+    }
+
+    public void setPaymentMethod(String paymentMethod) {
+        this.paymentMethod = paymentMethod;
+    }
+
+    public Long getTotalTransactions() {
+        return totalTransactions;
+    }
+
+    public void setTotalTransactions(Long totalTransactions) {
+        this.totalTransactions = totalTransactions;
+    }
+
+    public Long getTotalAmount() {
+        return totalAmount;
+    }
+
+    public void setTotalAmount(Long totalAmount) {
+        this.totalAmount = totalAmount;
+    }
+
     public static TransactionYearMethodResponse from(TransactionYearMethod dto) {
-        return TransactionYearMethodResponse.builder()
-                .reportYear(dto.getYear())
-                .paymentMethod(dto.getPaymentMethod())
-                .totalTransactions(dto.getTotalTransactions().longValue())
-                .totalAmount(dto.getTotalAmount())
-                .build();
+        return new TransactionYearMethodResponse(
+            dto.getYear(),
+            dto.getPaymentMethod(),
+            dto.getTotalTransactions(),
+            dto.getTotalAmount()
+        );
     }
 }

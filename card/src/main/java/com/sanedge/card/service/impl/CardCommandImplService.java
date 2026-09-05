@@ -10,6 +10,8 @@ import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.card.domain.response.CardResponse;
 import com.sanedge.card.domain.response.CardResponseDeleteAt;
 import com.sanedge.card.entity.Card;
+import com.sanedge.common.exception.InvalidRequestException;
+import com.sanedge.common.exception.ResourceNotFoundException;
 import pb.user.UserQueryService;
 import pb.user.User.FindByIdUserRequest;
 import io.quarkus.grpc.GrpcClient;
@@ -19,6 +21,7 @@ import com.sanedge.card.repository.CardCommandRepository;
 import com.sanedge.card.repository.CardQueryRepository;
 import com.sanedge.card.service.CardCommandService;
 import com.sanedge.common.utils.CardNumberGenerator;
+import com.sanedge.common.observability.TracingMetrics;
 
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
 import io.smallrye.mutiny.Uni;
@@ -46,6 +49,9 @@ public class CardCommandImplService implements CardCommandService {
 
     @Inject
     Validator validator;
+
+    @Inject
+    TracingMetrics tracingMetrics;
 
     @Override
     @WithTransaction
@@ -189,11 +195,12 @@ public class CardCommandImplService implements CardCommandService {
         return cardCommandRepository.restore(id)
                 .map(card -> {
                     if (card == null) {
-                        throw new IllegalArgumentException("Card not found");
+                        throw new InvalidRequestException("Card must be trashed first");
                     }
                     return new ApiResponse<>("success", "Card restored successfully", CardResponseDeleteAt.from(card));
                 })
-                .onFailure().recoverWithItem(e -> {
+                .onFailure(e -> !(e instanceof InvalidRequestException))
+                .recoverWithItem(e -> {
                     logger.error("💥 Failed to restore card id={}", id, e);
                     return new ApiResponse<>("error", "Failed to restore card", null);
                 });
@@ -204,8 +211,14 @@ public class CardCommandImplService implements CardCommandService {
     public Uni<ApiResponse<Boolean>> deleteCard(Long id) {
         logger.info("🧨 Permanently deleting card id={}", id);
         return cardCommandRepository.deletePermanent(id)
-                .map(deleted -> new ApiResponse<>("success", "Card permanently deleted", deleted))
-                .onFailure().recoverWithItem(e -> {
+                .map(deleted -> {
+                    if (deleted == null || !deleted.isPersistent()) {
+                        throw new InvalidRequestException("Card must be trashed before permanent deletion");
+                    }
+                    return new ApiResponse<>("success", "Card permanently deleted", true);
+                })
+                .onFailure(e -> !(e instanceof InvalidRequestException))
+                .recoverWithItem(e -> {
                     logger.error("💥 Failed to permanently delete card id={}", id, e);
                     return new ApiResponse<>("error", "Failed to permanently delete card", false);
                 });
@@ -216,8 +229,14 @@ public class CardCommandImplService implements CardCommandService {
     public Uni<ApiResponse<Boolean>> restoreAll() {
         logger.info("🔄 Restoring ALL trashed cards");
         return cardCommandRepository.restoreAllDeleted()
-                .map(restored -> new ApiResponse<>("success", "All cards restored successfully", restored))
-                .onFailure().recoverWithItem(e -> {
+                .map(restored -> {
+                    if (Boolean.FALSE.equals(restored)) {
+                        throw new ResourceNotFoundException("No trashed cards found");
+                    }
+                    return new ApiResponse<>("success", "All cards restored successfully", restored);
+                })
+                .onFailure(e -> !(e instanceof ResourceNotFoundException))
+                .recoverWithItem(e -> {
                     logger.error("💥 Failed to restore all cards", e);
                     return new ApiResponse<>("error", "Failed to restore all cards", false);
                 });
@@ -228,8 +247,14 @@ public class CardCommandImplService implements CardCommandService {
     public Uni<ApiResponse<Boolean>> deleteAll() {
         logger.info("💣 Permanently deleting ALL trashed cards");
         return cardCommandRepository.deleteAllDeleted()
-                .map(deleted -> new ApiResponse<>("success", "All cards permanently deleted", deleted))
-                .onFailure().recoverWithItem(e -> {
+                .map(deleted -> {
+                    if (Boolean.FALSE.equals(deleted)) {
+                        throw new ResourceNotFoundException("No trashed cards found");
+                    }
+                    return new ApiResponse<>("success", "All cards permanently deleted", deleted);
+                })
+                .onFailure(e -> !(e instanceof ResourceNotFoundException))
+                .recoverWithItem(e -> {
                     logger.error("💥 Failed to delete all cards", e);
                     return new ApiResponse<>("error", "Failed to delete all cards", false);
                 });

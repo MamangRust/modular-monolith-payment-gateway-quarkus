@@ -22,4 +22,28 @@ public class MonthStatusTransactionCardNumber {
     @Min(value = 1, message = "Bulan harus >= 1")
     @Max(value = 12, message = "Bulan harus <= 12")
     private int month;
+
+    public String getCardNumber() {
+        return cardNumber;
+    }
+
+    public void setCardNumber(String cardNumber) {
+        this.cardNumber = cardNumber;
+    }
+
+    public Long getYear() {
+        return year;
+    }
+
+    public void setYear(Long year) {
+        this.year = year;
+    }
+
+    public int getMonth() {
+        return month;
+    }
+
+    public void setMonth(int month) {
+        this.month = month;
+    }
 }

@@ -17,12 +17,51 @@ public class TransactionResponseMonthStatusSuccess {
     private Long totalAmount;
     private Long totalSuccess;
 
+    public TransactionResponseMonthStatusSuccess(String reportYear, String monthName, long totalAmount, long totalSuccess) {
+        this.reportYear = reportYear;
+        this.monthName = monthName;
+        this.totalAmount = totalAmount;
+        this.totalSuccess = totalSuccess;
+    }
+
+    public String getReportYear() {
+        return reportYear;
+    }
+
+    public void setReportYear(String reportYear) {
+        this.reportYear = reportYear;
+    }
+
+    public String getMonthName() {
+        return monthName;
+    }
+
+    public void setMonthName(String monthName) {
+        this.monthName = monthName;
+    }
+
+    public Long getTotalAmount() {
+        return totalAmount;
+    }
+
+    public void setTotalAmount(Long totalAmount) {
+        this.totalAmount = totalAmount;
+    }
+
+    public Long getTotalSuccess() {
+        return totalSuccess;
+    }
+
+    public void setTotalSuccess(Long totalSuccess) {
+        this.totalSuccess = totalSuccess;
+    }
+
     public static TransactionResponseMonthStatusSuccess from(TransactionMonthStatusSuccess dto) {
-        return TransactionResponseMonthStatusSuccess.builder()
-                .reportYear(dto.getYear())
-                .monthName(dto.getMonth())
-                .totalAmount(dto.getTotalAmount().longValue())
-                .totalSuccess(dto.getTotalSuccess().longValue())
-                .build();
+        return new TransactionResponseMonthStatusSuccess(
+            dto.getYear(),
+            dto.getMonth(),
+            dto.getTotalAmount(),
+            dto.getTotalSuccess()
+        );
     }
 }

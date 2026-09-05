@@ -2,6 +2,7 @@ package com.sanedge.topup.repository.statsbycard;
 
 import java.util.List;
 
+import com.sanedge.topup.domain.requests.statsbycard.MonthTopupStatusCardNumber;
 import com.sanedge.topup.entity.Topup;
 import com.sanedge.topup.entity.TopupMonthStatusFailed;
 import com.sanedge.topup.entity.TopupMonthStatusSuccess;
@@ -15,8 +16,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class TopupStatusByCardRepository implements PanacheRepository<Topup> {
 
-    public Uni<List<TopupMonthStatusSuccess>> findMonthTopupStatusSuccessByCard(
-            String cardNumber, Long startYear, Integer startMonth, Long endYear, Integer endMonth) {
+    public Uni<List<TopupMonthStatusSuccess>> findMonthTopupStatusSuccessByCard(MonthTopupStatusCardNumber req) {
+        String cardNumber = req.getCardNumber();
+        Long startYear = req.getYear();
         String sql = """
             WITH months AS (
                 SELECT 1 AS mon UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL
@@ -60,8 +62,9 @@ public class TopupStatusByCardRepository implements PanacheRepository<Topup> {
         );
     }
 
-    public Uni<List<TopupMonthStatusFailed>> findMonthTopupStatusFailedByCard(
-            String cardNumber, Long startYear, Integer startMonth, Long endYear, Integer endMonth) {
+    public Uni<List<TopupMonthStatusFailed>> findMonthTopupStatusFailedByCard(MonthTopupStatusCardNumber req) {
+        String cardNumber = req.getCardNumber();
+        Long startYear = req.getYear();
         String sql = """
             WITH months AS (
                 SELECT 1 AS mon UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL

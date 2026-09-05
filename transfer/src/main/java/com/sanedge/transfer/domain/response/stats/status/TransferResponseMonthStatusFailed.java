@@ -13,8 +13,8 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 public class TransferResponseMonthStatusFailed {
     private String reportYear;
-    private Long totalAmount;
     private String monthName;
+    private Long totalAmount;
     private Long totalFailed;
 
     public static TransferResponseMonthStatusFailed from(TransferMonthStatusFailed dto) {

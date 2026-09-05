@@ -4,6 +4,8 @@ import java.util.List;
 
 import com.sanedge.common.domain.response.PagedResult;
 import com.sanedge.transaction.entity.Transaction;
+import com.sanedge.transaction.domain.requests.FindAllTransactions;
+import com.sanedge.transaction.domain.requests.FindAllTransactionCardNumber;
 
 import io.quarkus.hibernate.reactive.panache.PanacheRepository;
 import io.quarkus.panache.common.Sort;
@@ -13,7 +15,11 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class TransactionQueryRepository implements PanacheRepository<Transaction> {
 
-    public Uni<PagedResult<Transaction>> findTransactions(String search, int page, int size) {
+    public Uni<PagedResult<Transaction>> findTransactions(FindAllTransactions req) {
+        String search = req.getSearch();
+        int page = req.getPage();
+        int size = req.getPageSize();
+
         var query = """
                     deletedAt IS NULL
                     AND (
@@ -32,11 +38,15 @@ public class TransactionQueryRepository implements PanacheRepository<Transaction
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
     }
 
-    public Uni<PagedResult<Transaction>> findActiveTransactions(String search, int page, int size) {
-        return findTransactions(search, page, size);
+    public Uni<PagedResult<Transaction>> findActiveTransactions(FindAllTransactions req) {
+        return findTransactions(req);
     }
 
-    public Uni<PagedResult<Transaction>> findTrashedTransactions(String search, int page, int size) {
+    public Uni<PagedResult<Transaction>> findTrashedTransactions(FindAllTransactions req) {
+        String search = req.getSearch();
+        int page = req.getPage();
+        int size = req.getPageSize();
+
         var query = """
                     deletedAt IS NOT NULL
                     AND (
@@ -59,7 +69,12 @@ public class TransactionQueryRepository implements PanacheRepository<Transaction
         return find("transactionId = ?1 AND deletedAt IS NULL", id).firstResult();
     }
 
-    public Uni<PagedResult<Transaction>> findTransactionsByCardNumber(String cardNumber, String filter, int page, int size) {
+    public Uni<PagedResult<Transaction>> findTransactionsByCardNumber(FindAllTransactionCardNumber req) {
+        String cardNumber = req.getCardNumber();
+        String filter = req.getSearch();
+        int page = req.getPage();
+        int size = req.getPageSize();
+
         var query = """
                     deletedAt IS NULL
                     AND cardNumber = ?1
@@ -80,5 +95,9 @@ public class TransactionQueryRepository implements PanacheRepository<Transaction
 
     public Uni<List<Transaction>> findTransactionsByMerchantId(Long merchantId) {
         return list("merchantId = ?1 AND deletedAt IS NULL", Sort.descending("transactionTime"), merchantId != null ? merchantId.intValue() : 0);
+    }
+
+    public Uni<List<Transaction>> findPendingCompensation(int maxAttempts) {
+        return find("compensationAttempts < ?1 AND deletedAt IS NULL", maxAttempts).list();
     }
 }

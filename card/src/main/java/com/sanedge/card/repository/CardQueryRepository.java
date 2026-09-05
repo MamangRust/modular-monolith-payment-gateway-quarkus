@@ -1,6 +1,9 @@
 package com.sanedge.card.repository;
 
+import java.util.Optional;
+
 import com.sanedge.common.domain.response.PagedResult;
+import com.sanedge.card.domain.requests.FindAllCards;
 import com.sanedge.card.entity.Card;
 
 import io.quarkus.hibernate.reactive.panache.PanacheRepository;
@@ -10,15 +13,30 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class CardQueryRepository implements PanacheRepository<Card> {
 
-    public Uni<PagedResult<Card>> findCards(String keyword, int page, int size) {
-        var query = """
-                    deletedAt IS NULL
-                    AND (
-                        ?1 IS NULL
-                        OR LOWER(cardNumber) LIKE LOWER(CONCAT('%', ?1, '%'))
-                        OR LOWER(cardType)   LIKE LOWER(CONCAT('%', ?1, '%'))
-                        OR LOWER(cardProvider) LIKE LOWER(CONCAT('%', ?1, '%'))
-                    )
+    public Uni<PagedResult<Card>> findCards(FindAllCards req) {
+        return findPage("deletedAt IS NULL", req);
+    }
+
+    public Uni<PagedResult<Card>> findActiveCards(FindAllCards req) {
+        return findPage("deletedAt IS NULL", req);
+    }
+
+    public Uni<PagedResult<Card>> findTrashedCards(FindAllCards req) {
+        return findPage("deletedAt IS NOT NULL", req);
+    }
+
+    private Uni<PagedResult<Card>> findPage(String deletedFilter, FindAllCards req) {
+        String keyword = (req.getSearch() != null && !req.getSearch().isEmpty()) ? req.getSearch() : null;
+        int page = req.getPage() != null && req.getPage() > 0 ? req.getPage() - 1 : 0;
+        int size = req.getPageSize() != null && req.getPageSize() > 0 ? req.getPageSize() : 10;
+
+        var query = deletedFilter + """
+                AND (
+                    ?1 IS NULL
+                    OR LOWER(cardNumber) LIKE LOWER(CONCAT('%', ?1, '%'))
+                    OR LOWER(cardType)   LIKE LOWER(CONCAT('%', ?1, '%'))
+                    OR LOWER(cardProvider) LIKE LOWER(CONCAT('%', ?1, '%'))
+                )
                 """;
 
         var panacheQuery = find(query, keyword)
@@ -29,56 +47,25 @@ public class CardQueryRepository implements PanacheRepository<Card> {
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
     }
 
-    public Uni<PagedResult<Card>> findActiveCards(String keyword, int page, int size) {
-        var query = """
-                    deletedAt IS NULL
-                    AND (
-                        ?1 IS NULL
-                        OR LOWER(cardNumber) LIKE LOWER(CONCAT('%', ?1, '%'))
-                        OR LOWER(cardType)   LIKE LOWER(CONCAT('%', ?1, '%'))
-                        OR LOWER(cardProvider) LIKE LOWER(CONCAT('%', ?1, '%'))
-                    )
-                """;
-
-        var panacheQuery = find(query, keyword)
-                .page(page, size);
-
-        return Uni.combine().all().unis(panacheQuery.list(), panacheQuery.count())
-                .asTuple()
-                .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
+    public Uni<Optional<Card>> findCardById(Long cardId) {
+        return find("cardId = ?1 AND deletedAt IS NULL", cardId).firstResult()
+                .map(Optional::ofNullable);
     }
 
-    public Uni<PagedResult<Card>> findTrashedCards(String keyword, int page, int size) {
-        var query = """
-                    deletedAt IS NOT NULL
-                    AND (
-                        ?1 IS NULL
-                        OR LOWER(cardNumber) LIKE LOWER(CONCAT('%', ?1, '%'))
-                        OR LOWER(cardType)   LIKE LOWER(CONCAT('%', ?1, '%'))
-                        OR LOWER(cardProvider) LIKE LOWER(CONCAT('%', ?1, '%'))
-                    )
-                """;
-
-        var panacheQuery = find(query, keyword)
-                .page(page, size);
-
-        return Uni.combine().all().unis(panacheQuery.list(), panacheQuery.count())
-                .asTuple()
-                .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
-    }
-
-    public Uni<Card> findCardById(Long cardId) {
-        return find("cardId = ?1 AND deletedAt IS NULL", cardId).firstResult();
-    }
-
-    public Uni<Card> findCardByUserId(Long userId) {
+    public Uni<Optional<Card>> findCardByUserId(Long userId) {
         if (userId == null) {
-            return Uni.createFrom().nullItem();
+            return Uni.createFrom().item(Optional.empty());
         }
-        return find("userId = ?1 AND deletedAt IS NULL", userId.intValue()).firstResult();
+        return find("userId = ?1 AND deletedAt IS NULL", userId.intValue()).firstResult()
+                .map(Optional::ofNullable);
     }
 
-    public Uni<Card> findCardByCardNumber(String cardNumber) {
+    public Uni<Optional<Card>> findCardByCardNumber(String cardNumber) {
+        return find("cardNumber = ?1 AND deletedAt IS NULL", cardNumber).firstResult()
+                .map(Optional::ofNullable);
+    }
+
+    public Uni<Card> findByCardNumber(String cardNumber) {
         return find("cardNumber = ?1 AND deletedAt IS NULL", cardNumber).firstResult();
     }
 }

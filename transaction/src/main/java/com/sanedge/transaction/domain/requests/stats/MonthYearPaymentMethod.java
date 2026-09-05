@@ -17,4 +17,20 @@ public class MonthYearPaymentMethod {
     @Min(value = 2000, message = "Tahun tidak valid")
     @Max(value = 2100, message = "Tahun tidak valid")
     private Long year;
+
+    public String getCardNumber() {
+        return cardNumber;
+    }
+
+    public void setCardNumber(String cardNumber) {
+        this.cardNumber = cardNumber;
+    }
+
+    public Long getYear() {
+        return year;
+    }
+
+    public void setYear(Long year) {
+        this.year = year;
+    }
 }

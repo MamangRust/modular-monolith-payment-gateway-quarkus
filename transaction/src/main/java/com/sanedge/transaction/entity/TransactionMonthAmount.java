@@ -10,4 +10,25 @@ import lombok.NoArgsConstructor;
 public class TransactionMonthAmount {
     private String month;
     private Long totalAmount;
+
+    public TransactionMonthAmount(String month, long totalAmount) {
+        this.month = month;
+        this.totalAmount = totalAmount;
+    }
+
+    public String getMonth() {
+        return month;
+    }
+
+    public void setMonth(String month) {
+        this.month = month;
+    }
+
+    public Long getTotalAmount() {
+        return totalAmount;
+    }
+
+    public void setTotalAmount(Long totalAmount) {
+        this.totalAmount = totalAmount;
+    }
 }

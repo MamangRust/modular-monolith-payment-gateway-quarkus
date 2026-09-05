@@ -12,21 +12,13 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sanedge.common.config.RedisService;
 import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.transfer.domain.response.stats.amount.TransferMonthAmountResponse;
 import com.sanedge.transfer.domain.response.stats.amount.TransferYearAmountResponse;
 import com.sanedge.transfer.repository.stats.TransferAmountRepository;
 import com.sanedge.transfer.service.stats.amount.TransferAmountService;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -38,10 +30,7 @@ public class TransferAmountImplService implements TransferAmountService {
     private final TransferAmountRepository transferAmountRepository;
     private final RedisService redisService;
     private final ObjectMapper objectMapper;
-
-    private final Tracer tracer;
-    private final LongCounter requestsTotal;
-    private final DoubleHistogram requestDurationSeconds;
+    private final TracingMetrics tracingMetrics;
 
     private static final long STATS_CACHE_TTL_SECONDS = 300;
 
@@ -49,20 +38,11 @@ public class TransferAmountImplService implements TransferAmountService {
     public TransferAmountImplService(TransferAmountRepository transferAmountRepository,
                                      RedisService redisService,
                                      ObjectMapper objectMapper,
-                                     OpenTelemetry openTelemetry) {
+                                     TracingMetrics tracingMetrics) {
         this.transferAmountRepository = transferAmountRepository;
         this.redisService = redisService;
         this.objectMapper = objectMapper;
-        this.tracer = openTelemetry.getTracer("transfer-amount-stats-service", "1.0.0");
-        Meter meter = openTelemetry.getMeter("transfer-amount-stats-service");
-
-        this.requestsTotal = meter.counterBuilder("requests_total")
-                .setDescription("Total number of requests")
-                .build();
-        this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                .setDescription("Request duration in seconds")
-                .setUnit("s")
-                .build();
+        this.tracingMetrics = tracingMetrics;
     }
 
     private String toJson(Object obj) {
@@ -98,6 +78,11 @@ public class TransferAmountImplService implements TransferAmountService {
 
         String cacheKey = String.format("transfers:stats:amount:month:%d", year);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_monthly_amounts")
+                .put("year", String.valueOf(year))
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -109,48 +94,20 @@ public class TransferAmountImplService implements TransferAmountService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findMonthlyTransferAmounts")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-amount-stats-service")
-                            .setAttribute("operation", "find_monthly_amounts")
-                            .setAttribute("year", String.valueOf(year))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findMonthlyTransferAmounts", "find_monthly_amounts", attrs,
+                            () -> transferAmountRepository.findMonthlyTransferAmounts(year)
+                                    .chain(amounts -> {
+                                        List<TransferMonthAmountResponse> response = amounts.stream()
+                                                .map(TransferMonthAmountResponse::from)
+                                                .collect(Collectors.toList());
 
-                    return transferAmountRepository.findMonthlyTransferAmounts(year)
-                            .chain(amounts -> {
-                                List<TransferMonthAmountResponse> response = amounts.stream()
-                                        .map(TransferMonthAmountResponse::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_monthly_amounts",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Monthly transfer amounts retrieved successfully!", response);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("❌ Failed to fetch monthly transfer amounts for year={}", year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_monthly_amounts",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to retrieve monthly transfer amounts", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_monthly_amounts"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success("Monthly transfer amounts retrieved successfully!", response));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("❌ Failed to fetch monthly transfer amounts for year={}", year, e);
+                                        return new ApiResponse<>("error", "Failed to retrieve monthly transfer amounts", Collections.emptyList());
+                                    }));
                 });
     }
 
@@ -165,6 +122,11 @@ public class TransferAmountImplService implements TransferAmountService {
 
         String cacheKey = String.format("transfers:stats:amount:year:%d", year);
 
+        Attributes attrs = Attributes.builder()
+                .put("operation", "find_yearly_amounts")
+                .put("year", String.valueOf(year))
+                .build();
+
         return redisService.getReactive(cacheKey)
                 .chain(cachedJson -> {
                     if (cachedJson != null) {
@@ -176,48 +138,20 @@ public class TransferAmountImplService implements TransferAmountService {
                     }
 
                     logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                    long startTime = System.currentTimeMillis();
-                    Span span = tracer.spanBuilder("findYearlyTransferAmounts")
-                            .setSpanKind(SpanKind.SERVER)
-                            .setAttribute("service.name", "transfer-amount-stats-service")
-                            .setAttribute("operation", "find_yearly_amounts")
-                            .setAttribute("year", String.valueOf(year))
-                            .startSpan();
+                    return tracingMetrics.traceAndMeasure("findYearlyTransferAmounts", "find_yearly_amounts", attrs,
+                            () -> transferAmountRepository.findYearlyTransferAmounts(year)
+                                    .chain(amounts -> {
+                                        List<TransferYearAmountResponse> response = amounts.stream()
+                                                .map(TransferYearAmountResponse::from)
+                                                .collect(Collectors.toList());
 
-                    return transferAmountRepository.findYearlyTransferAmounts(year)
-                            .chain(amounts -> {
-                                List<TransferYearAmountResponse> response = amounts.stream()
-                                        .map(TransferYearAmountResponse::from)
-                                        .collect(Collectors.toList());
-
-                                return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
-                                        .map(v -> {
-                                            span.setStatus(StatusCode.OK);
-                                            requestsTotal.add(1, Attributes.of(
-                                                    AttributeKey.stringKey("operation"), "find_yearly_amounts",
-                                                    AttributeKey.stringKey("status"), "success"));
-
-                                            return ApiResponse.success("Yearly transfer amounts retrieved successfully!", response);
-                                        });
-                            })
-                            .onFailure().recoverWithItem(e -> {
-                                logger.error("❌ Failed to fetch yearly transfer amounts until year={}", year, e);
-                                span.recordException(e);
-                                span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                requestsTotal.add(1, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_amounts",
-                                        AttributeKey.stringKey("status"), "failed",
-                                        AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                                return new ApiResponse<>("error", "Failed to retrieve yearly transfer amounts", Collections.emptyList());
-                            })
-                            .eventually(() -> {
-                                span.end();
-                                double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                requestDurationSeconds.record(duration, Attributes.of(
-                                        AttributeKey.stringKey("operation"), "find_yearly_amounts"));
-                            });
+                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
+                                                .map(v -> ApiResponse.success("Yearly transfer amounts retrieved successfully!", response));
+                                    })
+                                    .onFailure().recoverWithItem(e -> {
+                                        logger.error("❌ Failed to fetch yearly transfer amounts until year={}", year, e);
+                                        return new ApiResponse<>("error", "Failed to retrieve yearly transfer amounts", Collections.emptyList());
+                                    }));
                 });
     }
 }

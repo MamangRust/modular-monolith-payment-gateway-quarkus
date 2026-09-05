@@ -1,6 +1,7 @@
 package com.sanedge.card.service.impl;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -18,19 +19,12 @@ import com.sanedge.common.domain.response.PagedResult;
 import com.sanedge.common.domain.response.PaginationMeta;
 import com.sanedge.card.domain.response.CardResponse;
 import com.sanedge.card.domain.response.CardResponseDeleteAt;
+import com.sanedge.card.entity.Card;
 import com.sanedge.card.repository.CardQueryRepository;
 import com.sanedge.card.service.CardQueryService;
+import com.sanedge.common.observability.TracingMetrics;
 
-import io.opentelemetry.api.OpenTelemetry;
-import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
-import io.opentelemetry.api.metrics.DoubleHistogram;
-import io.opentelemetry.api.metrics.LongCounter;
-import io.opentelemetry.api.metrics.Meter;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -43,31 +37,19 @@ public class CardQueryServiceImpl implements CardQueryService {
         private final CardQueryRepository cardQueryRepository;
         private final RedisService redisService;
         private final ObjectMapper objectMapper;
-
-        private final Tracer tracer;
-        private final LongCounter requestsTotal;
-        private final DoubleHistogram requestDurationSeconds;
+        private final TracingMetrics tracingMetrics;
 
         private static final long LIST_CACHE_TTL_SECONDS = 300;
 
         @Inject
         public CardQueryServiceImpl(CardQueryRepository cardQueryRepository,
-                        OpenTelemetry openTelemetry,
                         RedisService redisService,
-                        ObjectMapper objectMapper) {
+                        ObjectMapper objectMapper,
+                        TracingMetrics tracingMetrics) {
                 this.cardQueryRepository = cardQueryRepository;
                 this.redisService = redisService;
                 this.objectMapper = objectMapper;
-                this.tracer = openTelemetry.getTracer("card-query-service", "1.0.0");
-                Meter meter = openTelemetry.getMeter("card-query-service");
-
-                this.requestsTotal = meter.counterBuilder("requests_total")
-                                .setDescription("Total number of requests")
-                                .build();
-                this.requestDurationSeconds = meter.histogramBuilder("request_duration_seconds")
-                                .setDescription("Request duration in seconds")
-                                .setUnit("s")
-                                .build();
+                this.tracingMetrics = tracingMetrics;
         }
 
         private String toJson(Object obj) {
@@ -102,68 +84,41 @@ public class CardQueryServiceImpl implements CardQueryService {
                 String cacheKey = String.format("cards:all:%d:%d:%s", req.getPage(), req.getPageSize(),
                                 req.getSearch());
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 ApiResponsePagination<List<CardResponse>> response = fromJson(cachedJson,
-                                                                 new TypeReference<ApiResponsePagination<List<CardResponse>>>() {
-                                                                 });
-                                                 return Uni.createFrom().item(response);
-                                         }
+                return tracingMetrics.traceAndMeasure("findAllCards", "find_all_cards",
+                                Attributes.builder().put("operation", "find_all_cards").build(), () -> {
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                if (cachedJson != null) {
+                                                                        logger.info("Cache HIT for key: {}", cacheKey);
+                                                                        ApiResponsePagination<List<CardResponse>> response = fromJson(cachedJson,
+                                                                                        new TypeReference<ApiResponsePagination<List<CardResponse>>>() {
+                                                                                        });
+                                                                        return Uni.createFrom().item(response);
+                                                                }
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findAllCards")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "card-query-service")
-                                                         .setAttribute("operation", "find_all_cards")
-                                                         .startSpan();
+                                                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                         int page = req.getPage() > 0 ? req.getPage() - 1 : 0;
-                                         int size = req.getPageSize() > 0 ? req.getPageSize() : 10;
-                                         String search = (req.getSearch() != null && !req.getSearch().isEmpty()) ? req.getSearch() : null;
+                                                                return cardQueryRepository.findCards(req)
+                                                                                .chain(pagedResult -> {
+                                                                                        ApiResponsePagination<List<CardResponse>> response = buildPaginatedResponse(
+                                                                                                        pagedResult, req, "Cards retrieved successfully",
+                                                                                                        CardResponse::from);
 
-                                         return cardQueryRepository.findCards(search, page, size)
-                                                         .chain(pagedResult -> {
-                                                                 span.setAttribute("card.count", pagedResult.getTotalRecords());
-                                                                 span.setAttribute("card.page", req.getPage());
-                                                                 span.setAttribute("card.size", req.getPageSize());
-
-                                                                 ApiResponsePagination<List<CardResponse>> response = buildPaginatedResponse(
-                                                                                 pagedResult, req, "Cards retrieved successfully",
-                                                                                 CardResponse::from);
-
-                                                                 return redisService.setWithExpirationReactive(cacheKey, toJson(response), LIST_CACHE_TTL_SECONDS)
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached response for key: {}", cacheKey);
-                                                                                         logger.info("Successfully retrieved {} cards", pagedResult.getTotalRecords());
-                                                                                         span.setStatus(StatusCode.OK);
-
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_all_cards",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-                                                                                         return response;
-                                                                                 });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding all cards", e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_all_cards",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_all_cards"));
-                                                                 logger.debug("Find all cards operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response),
+                                                                                                        LIST_CACHE_TTL_SECONDS)
+                                                                                                        .map(v -> {
+                                                                                                                logger.info("Cached response for key: {}", cacheKey);
+                                                                                                                logger.info("Successfully retrieved {} cards",
+                                                                                                                                pagedResult.getTotalRecords());
+                                                                                                                return response;
+                                                                                                        });
+                                                                                });
+                                                        });
+                                }).onFailure().recoverWithItem(e -> {
+                                        logger.error("Error finding all cards", e);
+                                        return new ApiResponsePagination<List<CardResponse>>("error",
+                                                        "Failed to retrieve cards", List.of(), null);
+                                });
         }
 
         @Override
@@ -171,68 +126,41 @@ public class CardQueryServiceImpl implements CardQueryService {
                 String cacheKey = String.format("cards:active:%d:%d:%s", req.getPage(), req.getPageSize(),
                                 req.getSearch());
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 ApiResponsePagination<List<CardResponseDeleteAt>> response = fromJson(cachedJson,
-                                                                 new TypeReference<ApiResponsePagination<List<CardResponseDeleteAt>>>() {
-                                                                 });
-                                                 return Uni.createFrom().item(response);
-                                         }
+                return tracingMetrics.traceAndMeasure("findActiveCards", "find_active_cards",
+                                Attributes.builder().put("operation", "find_active_cards").build(), () -> {
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                if (cachedJson != null) {
+                                                                        logger.info("Cache HIT for key: {}", cacheKey);
+                                                                        ApiResponsePagination<List<CardResponseDeleteAt>> response = fromJson(cachedJson,
+                                                                                        new TypeReference<ApiResponsePagination<List<CardResponseDeleteAt>>>() {
+                                                                                        });
+                                                                        return Uni.createFrom().item(response);
+                                                                }
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findActiveCards")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "card-query-service")
-                                                         .setAttribute("operation", "find_active_cards")
-                                                         .startSpan();
+                                                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                         int page = req.getPage() > 0 ? req.getPage() - 1 : 0;
-                                         int size = req.getPageSize() > 0 ? req.getPageSize() : 10;
-                                         String search = (req.getSearch() != null && !req.getSearch().isEmpty()) ? req.getSearch() : null;
+                                                                return cardQueryRepository.findActiveCards(req)
+                                                                                .chain(pagedResult -> {
+                                                                                        ApiResponsePagination<List<CardResponseDeleteAt>> response = buildPaginatedResponse(
+                                                                                                        pagedResult, req, "Active cards retrieved successfully",
+                                                                                                        CardResponseDeleteAt::from);
 
-                                         return cardQueryRepository.findActiveCards(search, page, size)
-                                                         .chain(pagedResult -> {
-                                                                 span.setAttribute("card.count", pagedResult.getTotalRecords());
-                                                                 span.setAttribute("card.page", req.getPage());
-                                                                 span.setAttribute("card.size", req.getPageSize());
-
-                                                                 ApiResponsePagination<List<CardResponseDeleteAt>> response = buildPaginatedResponse(
-                                                                                 pagedResult, req, "Active cards retrieved successfully",
-                                                                                 CardResponseDeleteAt::from);
-
-                                                                 return redisService.setWithExpirationReactive(cacheKey, toJson(response), LIST_CACHE_TTL_SECONDS)
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached response for key: {}", cacheKey);
-                                                                                         logger.info("Successfully retrieved {} active cards", pagedResult.getTotalRecords());
-                                                                                         span.setStatus(StatusCode.OK);
-
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_active_cards",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-                                                                                         return response;
-                                                                                 });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding active cards", e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_active_cards",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_active_cards"));
-                                                                 logger.debug("Find active cards operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response),
+                                                                                                        LIST_CACHE_TTL_SECONDS)
+                                                                                                        .map(v -> {
+                                                                                                                logger.info("Cached response for key: {}", cacheKey);
+                                                                                                                logger.info("Successfully retrieved {} active cards",
+                                                                                                                                pagedResult.getTotalRecords());
+                                                                                                                return response;
+                                                                                                        });
+                                                                                });
+                                                        });
+                                }).onFailure().recoverWithItem(e -> {
+                                        logger.error("Error finding active cards", e);
+                                        return new ApiResponsePagination<List<CardResponseDeleteAt>>("error",
+                                                        "Failed to retrieve active cards", List.of(), null);
+                                });
         }
 
         @Override
@@ -240,290 +168,145 @@ public class CardQueryServiceImpl implements CardQueryService {
                 String cacheKey = String.format("cards:trashed:%d:%d:%s", req.getPage(), req.getPageSize(),
                                 req.getSearch());
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 ApiResponsePagination<List<CardResponseDeleteAt>> response = fromJson(cachedJson,
-                                                                 new TypeReference<ApiResponsePagination<List<CardResponseDeleteAt>>>() {
-                                                                 });
-                                                 return Uni.createFrom().item(response);
-                                         }
+                return tracingMetrics.traceAndMeasure("findTrashedCards", "find_trashed_cards",
+                                Attributes.builder().put("operation", "find_trashed_cards").build(), () -> {
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                if (cachedJson != null) {
+                                                                        logger.info("Cache HIT for key: {}", cacheKey);
+                                                                        ApiResponsePagination<List<CardResponseDeleteAt>> response = fromJson(cachedJson,
+                                                                                        new TypeReference<ApiResponsePagination<List<CardResponseDeleteAt>>>() {
+                                                                                        });
+                                                                        return Uni.createFrom().item(response);
+                                                                }
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findTrashedCards")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "card-query-service")
-                                                         .setAttribute("operation", "find_trashed_cards")
-                                                         .startSpan();
+                                                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                         int page = req.getPage() > 0 ? req.getPage() - 1 : 0;
-                                         int size = req.getPageSize() > 0 ? req.getPageSize() : 10;
-                                         String search = (req.getSearch() != null && !req.getSearch().isEmpty()) ? req.getSearch() : null;
+                                                                return cardQueryRepository.findTrashedCards(req)
+                                                                                .chain(pagedResult -> {
+                                                                                        ApiResponsePagination<List<CardResponseDeleteAt>> response = buildPaginatedResponse(
+                                                                                                        pagedResult, req, "Trashed cards retrieved successfully",
+                                                                                                        CardResponseDeleteAt::from);
 
-                                         return cardQueryRepository.findTrashedCards(search, page, size)
-                                                         .chain(pagedResult -> {
-                                                                 span.setAttribute("card.count", pagedResult.getTotalRecords());
-                                                                 span.setAttribute("card.page", req.getPage());
-                                                                 span.setAttribute("card.size", req.getPageSize());
-
-                                                                 ApiResponsePagination<List<CardResponseDeleteAt>> response = buildPaginatedResponse(
-                                                                                 pagedResult, req, "Trashed cards retrieved successfully",
-                                                                                 CardResponseDeleteAt::from);
-
-                                                                 return redisService.setWithExpirationReactive(cacheKey, toJson(response), LIST_CACHE_TTL_SECONDS)
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached response for key: {}", cacheKey);
-                                                                                         logger.info("Successfully retrieved {} trashed cards", pagedResult.getTotalRecords());
-                                                                                         span.setStatus(StatusCode.OK);
-
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_trashed_cards",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-                                                                                         return response;
-                                                                                 });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding trashed cards", e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_trashed_cards",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_trashed_cards"));
-                                                                 logger.debug("Find trashed cards operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                                                        return redisService.setWithExpirationReactive(cacheKey, toJson(response),
+                                                                                                        LIST_CACHE_TTL_SECONDS)
+                                                                                                        .map(v -> {
+                                                                                                                logger.info("Cached response for key: {}", cacheKey);
+                                                                                                                logger.info("Successfully retrieved {} trashed cards",
+                                                                                                                                pagedResult.getTotalRecords());
+                                                                                                                return response;
+                                                                                                        });
+                                                                                });
+                                                        });
+                                }).onFailure().recoverWithItem(e -> {
+                                        logger.error("Error finding trashed cards", e);
+                                        return new ApiResponsePagination<List<CardResponseDeleteAt>>("error",
+                                                        "Failed to retrieve trashed cards", List.of(), null);
+                                });
         }
 
         @Override
         public Uni<ApiResponse<CardResponse>> findById(Long cardId) {
                 String cacheKey = "card:id:" + cardId;
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 CardResponse cachedCard = fromJson(cachedJson, CardResponse.class);
-                                                 return Uni.createFrom().item(ApiResponse.success("Card retrieved successfully", cachedCard));
-                                         }
+                return tracingMetrics.traceAndMeasure("findCardById", "find_card_by_id",
+                                Attributes.builder().put("operation", "find_card_by_id").build(), () -> {
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                if (cachedJson != null) {
+                                                                        logger.info("Cache HIT for key: {}", cacheKey);
+                                                                        CardResponse cachedCard = fromJson(cachedJson, CardResponse.class);
+                                                                        return Uni.createFrom().item(ApiResponse.success("Card retrieved successfully", cachedCard));
+                                                                }
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findCardById")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "card-query-service")
-                                                         .setAttribute("operation", "find_card_by_id")
-                                                         .setAttribute("card.id", cardId.toString())
-                                                         .startSpan();
+                                                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                         return cardQueryRepository.findCardById(cardId)
-                                                         .chain(card -> {
-                                                                 if (card == null) {
-                                                                         logger.warn("Card not found with id: {}", cardId);
-                                                                         span.setStatus(StatusCode.ERROR, "Card not found");
-                                                                         span.setAttribute("card.found", false);
+                                                                return cardQueryRepository.findCardById(cardId)
+                                                                                .chain(opt -> {
+                                                                                        if (opt.isEmpty()) {
+                                                                                                logger.warn("Card not found with id: {}", cardId);
+                                                                                                throw new NotFoundException("Card not found with id: " + cardId);
+                                                                                        }
+                                                                                        Card card = opt.get();
+                                                                                        logger.info("Successfully found card with id: {} and number: {}", cardId,
+                                                                                                        card.getCardNumber());
+                                                                                        CardResponse cardResponse = CardResponse.from(card);
 
-                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                         AttributeKey.stringKey("operation"), "find_card_by_id",
-                                                                                         AttributeKey.stringKey("status"), "failed",
-                                                                                         AttributeKey.stringKey("error_type"), "not_found"));
-
-                                                                         throw new NotFoundException("Card not found with id: " + cardId);
-                                                                 }
-
-                                                                 span.setAttribute("card.found", true);
-                                                                 span.setAttribute("card.number", card.getCardNumber());
-
-                                                                 CardResponse cardResponse = CardResponse.from(card);
-
-                                                                 return redisService.setReactive(cacheKey, toJson(cardResponse))
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached card for key: {}", cacheKey);
-                                                                                         logger.info("Successfully found card with id: {} and number: {}", cardId, card.getCardNumber());
-                                                                                         span.setStatus(StatusCode.OK);
-
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_card_by_id",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-
-                                                                                         return ApiResponse.success("Card retrieved successfully", cardResponse);
-                                                                                 });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding card by id: {}", cardId, e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_card_by_id",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_card_by_id"));
-                                                                 logger.debug("Find card by id operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                                                        return redisService.setReactive(cacheKey, toJson(cardResponse))
+                                                                                                        .map(v -> ApiResponse.success("Card retrieved successfully",
+                                                                                                                        cardResponse));
+                                                                                });
+                                                        });
+                                });
         }
 
         @Override
         public Uni<ApiResponse<CardResponse>> findByUserId(Long userId) {
                 String cacheKey = "card:user:" + userId;
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 CardResponse cachedCard = fromJson(cachedJson, CardResponse.class);
-                                                 return Uni.createFrom().item(ApiResponse.success("Card retrieved successfully", cachedCard));
-                                         }
+                return tracingMetrics.traceAndMeasure("findCardByUserId", "find_card_by_user_id",
+                                Attributes.builder().put("operation", "find_card_by_user_id").build(), () -> {
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                if (cachedJson != null) {
+                                                                        logger.info("Cache HIT for key: {}", cacheKey);
+                                                                        CardResponse cachedCard = fromJson(cachedJson, CardResponse.class);
+                                                                        return Uni.createFrom().item(ApiResponse.success("Card retrieved successfully", cachedCard));
+                                                                }
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findCardByUserId")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "card-query-service")
-                                                         .setAttribute("operation", "find_card_by_user_id")
-                                                         .setAttribute("user.id", userId.toString())
-                                                         .startSpan();
+                                                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                         return cardQueryRepository.findCardByUserId(userId)
-                                                         .chain(card -> {
-                                                                 if (card == null) {
-                                                                         logger.warn("Card not found for user id: {}", userId);
-                                                                         span.setStatus(StatusCode.ERROR, "Card not found");
-                                                                         span.setAttribute("card.found", false);
+                                                                return cardQueryRepository.findCardByUserId(userId)
+                                                                                .chain(opt -> {
+                                                                                        if (opt.isEmpty()) {
+                                                                                                logger.warn("Card not found for user id: {}", userId);
+                                                                                                throw new NotFoundException("Card not found for user id: " + userId);
+                                                                                        }
+                                                                                        Card card = opt.get();
+                                                                                        logger.info("Successfully found card for user id: {} and number: {}", userId,
+                                                                                                        card.getCardNumber());
+                                                                                        CardResponse cardResponse = CardResponse.from(card);
 
-                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                         AttributeKey.stringKey("operation"), "find_card_by_user_id",
-                                                                                         AttributeKey.stringKey("status"), "failed",
-                                                                                         AttributeKey.stringKey("error_type"), "not_found"));
-
-                                                                         throw new NotFoundException("Card not found for user id: " + userId);
-                                                                 }
-
-                                                                 span.setAttribute("card.found", true);
-                                                                 span.setAttribute("card.number", card.getCardNumber());
-
-                                                                 CardResponse cardResponse = CardResponse.from(card);
-
-                                                                 return redisService.setReactive(cacheKey, toJson(cardResponse))
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached card for key: {}", cacheKey);
-                                                                                         logger.info("Successfully found card for user id: {} and number: {}", userId, card.getCardNumber());
-                                                                                         span.setStatus(StatusCode.OK);
-
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_card_by_user_id",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-
-                                                                                         return ApiResponse.success("Card retrieved successfully", cardResponse);
-                                                                                 });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding card by user id: {}", userId, e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_card_by_user_id",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_card_by_user_id"));
-                                                                 logger.debug("Find card by user id operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                                                        return redisService.setReactive(cacheKey, toJson(cardResponse))
+                                                                                                        .map(v -> ApiResponse.success("Card retrieved successfully",
+                                                                                                                        cardResponse));
+                                                                                });
+                                                        });
+                                });
         }
 
         @Override
         public Uni<ApiResponse<CardResponse>> findByCardNumber(String cardNumber) {
                 String cacheKey = "card:number:" + cardNumber;
 
-                return redisService.getReactive(cacheKey)
-                                .chain(cachedJson -> {
-                                         if (cachedJson != null) {
-                                                 logger.info("Cache HIT for key: {}", cacheKey);
-                                                 CardResponse cachedCard = fromJson(cachedJson, CardResponse.class);
-                                                 return Uni.createFrom().item(ApiResponse.success("Card retrieved successfully", cachedCard));
-                                         }
+                return tracingMetrics.traceAndMeasure("findCardByCardNumber", "find_card_by_card_number",
+                                Attributes.builder().put("operation", "find_card_by_card_number").build(), () -> {
+                                        return redisService.getReactive(cacheKey)
+                                                        .chain(cachedJson -> {
+                                                                if (cachedJson != null) {
+                                                                        logger.info("Cache HIT for key: {}", cacheKey);
+                                                                        CardResponse cachedCard = fromJson(cachedJson, CardResponse.class);
+                                                                        return Uni.createFrom().item(ApiResponse.success("Card retrieved successfully", cachedCard));
+                                                                }
 
-                                         logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
-                                         long startTime = System.currentTimeMillis();
-                                         Span span = tracer.spanBuilder("findCardByCardNumber")
-                                                         .setSpanKind(SpanKind.SERVER)
-                                                         .setAttribute("service.name", "card-query-service")
-                                                         .setAttribute("operation", "find_card_by_card_number")
-                                                         .setAttribute("card.number", cardNumber)
-                                                         .startSpan();
+                                                                logger.info("Cache MISS for key: {}. Fetching from DB.", cacheKey);
 
-                                         return cardQueryRepository.findCardByCardNumber(cardNumber)
-                                                         .chain(card -> {
-                                                                 if (card == null) {
-                                                                         logger.warn("Card not found with card number: {}", cardNumber);
-                                                                         span.setStatus(StatusCode.ERROR, "Card not found");
-                                                                         span.setAttribute("card.found", false);
+                                                                return cardQueryRepository.findCardByCardNumber(cardNumber)
+                                                                                .chain(opt -> {
+                                                                                        if (opt.isEmpty()) {
+                                                                                                logger.warn("Card not found with card number: {}", cardNumber);
+                                                                                                throw new NotFoundException("Card not found with card number: " + cardNumber);
+                                                                                        }
+                                                                                        Card card = opt.get();
+                                                                                        logger.info("Successfully found card with card number: {}", cardNumber);
+                                                                                        CardResponse cardResponse = CardResponse.from(card);
 
-                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                         AttributeKey.stringKey("operation"), "find_card_by_card_number",
-                                                                                         AttributeKey.stringKey("status"), "failed",
-                                                                                         AttributeKey.stringKey("error_type"), "not_found"));
-
-                                                                         throw new NotFoundException("Card not found with card number: " + cardNumber);
-                                                                 }
-
-                                                                 span.setAttribute("card.found", true);
-                                                                 span.setAttribute("card.number", card.getCardNumber());
-
-                                                                 CardResponse cardResponse = CardResponse.from(card);
-
-                                                                 return redisService.setReactive(cacheKey, toJson(cardResponse))
-                                                                                 .map(v -> {
-                                                                                         logger.info("Cached card for key: {}", cacheKey);
-                                                                                         logger.info("Successfully found card with card number: {}", cardNumber);
-                                                                                         span.setStatus(StatusCode.OK);
-
-                                                                                         requestsTotal.add(1, Attributes.of(
-                                                                                                         AttributeKey.stringKey("operation"), "find_card_by_card_number",
-                                                                                                         AttributeKey.stringKey("status"), "success"));
-
-                                                                                         return ApiResponse.success("Card retrieved successfully", cardResponse);
-                                                                                 });
-                                                         })
-                                                         .onFailure().invoke(e -> {
-                                                                 logger.error("Error finding card by card number: {}", cardNumber, e);
-                                                                 span.recordException(e);
-                                                                 span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                                                                 requestsTotal.add(1, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_card_by_card_number",
-                                                                                 AttributeKey.stringKey("status"), "failed",
-                                                                                 AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-                                                         })
-                                                         .eventually(() -> {
-                                                                 span.end();
-                                                                 double duration = (System.currentTimeMillis() - startTime) / 1000.0;
-                                                                 requestDurationSeconds.record(duration, Attributes.of(
-                                                                                 AttributeKey.stringKey("operation"), "find_card_by_card_number"));
-                                                                 logger.debug("Find card by card number operation completed in {} seconds", duration);
-                                                         });
-                                 });
+                                                                                        return redisService.setReactive(cacheKey, toJson(cardResponse))
+                                                                                                        .map(v -> ApiResponse.success("Card retrieved successfully",
+                                                                                                                        cardResponse));
+                                                                                });
+                                                        });
+                                });
         }
 
         private <T, R> ApiResponsePagination<List<R>> buildPaginatedResponse(

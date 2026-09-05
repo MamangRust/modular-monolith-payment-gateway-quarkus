@@ -3,6 +3,8 @@ package com.sanedge.withdraw.repository;
 import java.util.List;
 
 import com.sanedge.common.domain.response.PagedResult;
+import com.sanedge.withdraw.domain.requests.FindAllWithdrawCardNumber;
+import com.sanedge.withdraw.domain.requests.FindAllWithdraws;
 import com.sanedge.withdraw.entity.Withdraw;
 
 import io.quarkus.hibernate.reactive.panache.PanacheRepository;
@@ -13,7 +15,10 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class WithdrawQueryRepository implements PanacheRepository<Withdraw> {
 
-    public Uni<PagedResult<Withdraw>> findAllWithdraws(String keyword, int page, int size) {
+    public Uni<PagedResult<Withdraw>> findAllWithdraws(FindAllWithdraws req) {
+        String keyword = req.getSearch();
+        int page = req.getPage();
+        int size = req.getPageSize();
         var query = """
                     deletedAt IS NULL
                     AND (
@@ -33,11 +38,14 @@ public class WithdrawQueryRepository implements PanacheRepository<Withdraw> {
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
     }
 
-    public Uni<PagedResult<Withdraw>> findActiveWithdraws(String keyword, int page, int size) {
-        return findAllWithdraws(keyword, page, size);
+    public Uni<PagedResult<Withdraw>> findActiveWithdraws(FindAllWithdraws req) {
+        return findAllWithdraws(req);
     }
 
-    public Uni<PagedResult<Withdraw>> findTrashedWithdraws(String keyword, int page, int size) {
+    public Uni<PagedResult<Withdraw>> findTrashedWithdraws(FindAllWithdraws req) {
+        String keyword = req.getSearch();
+        int page = req.getPage();
+        int size = req.getPageSize();
         var query = """
                     deletedAt IS NOT NULL
                     AND (
@@ -61,7 +69,11 @@ public class WithdrawQueryRepository implements PanacheRepository<Withdraw> {
         return list("deletedAt IS NULL AND cardNumber = ?1", Sort.descending("withdrawTime"), cardNumber);
     }
 
-    public Uni<PagedResult<Withdraw>> findAllByCardNumber(String cardNumber, String keyword, int page, int size) {
+    public Uni<PagedResult<Withdraw>> findAllByCardNumber(FindAllWithdrawCardNumber req) {
+        String cardNumber = req.getCardNumber();
+        String keyword = req.getSearch();
+        int page = req.getPage();
+        int size = req.getPageSize();
         var query = """
                     deletedAt IS NULL
                     AND cardNumber = ?1
@@ -79,5 +91,9 @@ public class WithdrawQueryRepository implements PanacheRepository<Withdraw> {
         return Uni.combine().all().unis(panacheQuery.list(), panacheQuery.count())
                 .asTuple()
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
+    }
+
+    public Uni<List<Withdraw>> findPendingCompensation(int maxAttempts) {
+        return find("compensationAttempts < ?1 AND deletedAt IS NULL", maxAttempts).list();
     }
 }

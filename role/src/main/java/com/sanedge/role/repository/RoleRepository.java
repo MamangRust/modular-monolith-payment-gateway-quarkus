@@ -5,6 +5,7 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 import com.sanedge.common.domain.response.PagedResult;
+import com.sanedge.role.domain.requests.FindAllRoles;
 import com.sanedge.role.entity.Role;
 
 import io.quarkus.hibernate.reactive.panache.PanacheRepository;
@@ -15,7 +16,11 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class RoleRepository implements PanacheRepository<Role> {
 
-    public Uni<PagedResult<Role>> findRoles(String keyword, int page, int size) {
+    public Uni<PagedResult<Role>> findRoles(FindAllRoles req) {
+        int page = req.getPage() > 0 ? req.getPage() - 1 : 0;
+        int size = req.getPageSize() > 0 ? req.getPageSize() : 10;
+        String keyword = (req.getSearch() != null && !req.getSearch().isEmpty()) ? req.getSearch() : null;
+
         var query = """
                     (?1 IS NULL
                      OR LOWER(roleName) LIKE LOWER(CONCAT('%', ?1, '%')))
@@ -29,7 +34,11 @@ public class RoleRepository implements PanacheRepository<Role> {
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
     }
 
-    public Uni<PagedResult<Role>> findActiveRoles(String keyword, int page, int size) {
+    public Uni<PagedResult<Role>> findActiveRoles(FindAllRoles req) {
+        int page = req.getPage() > 0 ? req.getPage() - 1 : 0;
+        int size = req.getPageSize() > 0 ? req.getPageSize() : 10;
+        String keyword = (req.getSearch() != null && !req.getSearch().isEmpty()) ? req.getSearch() : null;
+
         var query = """
                     deletedAt IS NULL
                     AND (
@@ -46,7 +55,11 @@ public class RoleRepository implements PanacheRepository<Role> {
                 .map(tuple -> new PagedResult<>(tuple.getItem1(), tuple.getItem2().intValue()));
     }
 
-    public Uni<PagedResult<Role>> findTrashedRoles(String keyword, int page, int size) {
+    public Uni<PagedResult<Role>> findTrashedRoles(FindAllRoles req) {
+        int page = req.getPage() > 0 ? req.getPage() - 1 : 0;
+        int size = req.getPageSize() > 0 ? req.getPageSize() : 10;
+        String keyword = (req.getSearch() != null && !req.getSearch().isEmpty()) ? req.getSearch() : null;
+
         var query = """
                     deletedAt IS NOT NULL
                     AND (

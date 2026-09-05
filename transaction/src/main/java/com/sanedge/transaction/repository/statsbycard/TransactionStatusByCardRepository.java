@@ -2,6 +2,7 @@ package com.sanedge.transaction.repository.statsbycard;
 
 import java.util.List;
 
+import com.sanedge.transaction.domain.requests.statsbycard.MonthStatusTransactionCardNumber;
 import com.sanedge.transaction.entity.Transaction;
 import com.sanedge.transaction.entity.TransactionMonthStatusFailed;
 import com.sanedge.transaction.entity.TransactionMonthStatusSuccess;
@@ -16,7 +17,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 public class TransactionStatusByCardRepository implements PanacheRepository<Transaction> {
 
     public Uni<List<TransactionMonthStatusSuccess>> findMonthTransactionStatusSuccessByCard(
-            String cardNumber, Long startYear, Integer startMonth, Long endYear, Integer endMonth) {
+            MonthStatusTransactionCardNumber req) {
         String sql = """
             WITH months AS (
                 SELECT 1 AS mon UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL
@@ -45,8 +46,8 @@ public class TransactionStatusByCardRepository implements PanacheRepository<Tran
 
         return getSession().chain(session ->
             session.createNativeQuery(sql, Object[].class)
-                .setParameter("cardNumber", cardNumber)
-                .setParameter("startYear", startYear)
+                .setParameter("cardNumber", req.getCardNumber())
+                .setParameter("startYear", req.getYear())
                 .getResultList()
                 .map(list -> list.stream()
                     .map(row -> new TransactionMonthStatusSuccess(
@@ -61,7 +62,7 @@ public class TransactionStatusByCardRepository implements PanacheRepository<Tran
     }
 
     public Uni<List<TransactionMonthStatusFailed>> findMonthTransactionStatusFailedByCard(
-            String cardNumber, Long startYear, Integer startMonth, Long endYear, Integer endMonth) {
+            MonthStatusTransactionCardNumber req) {
         String sql = """
             WITH months AS (
                 SELECT 1 AS mon UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL
@@ -90,8 +91,8 @@ public class TransactionStatusByCardRepository implements PanacheRepository<Tran
 
         return getSession().chain(session ->
             session.createNativeQuery(sql, Object[].class)
-                .setParameter("cardNumber", cardNumber)
-                .setParameter("startYear", startYear)
+                .setParameter("cardNumber", req.getCardNumber())
+                .setParameter("startYear", req.getYear())
                 .getResultList()
                 .map(list -> list.stream()
                     .map(row -> new TransactionMonthStatusFailed(
