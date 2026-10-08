@@ -3,6 +3,7 @@ package com.sanedge.saldo.handler;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.time.LocalDateTime;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -149,6 +151,29 @@ class SaldoCommandGrpcHandlerTest {
         }
 
         @Test
+        @DisplayName("updateSaldoBalance - maps delta fields to domain request")
+        void updateBalance_MapsDeltaFields() {
+                SaldoCommand.UpdateSaldoBalanceRequest request = SaldoCommand.UpdateSaldoBalanceRequest.newBuilder()
+                                .setCardNumber("1234-5678-9012-3456")
+                                .setDeltaBalance(-25000)
+                                .setMinimumBalance(10000)
+                                .setOperationKey("op:test:1")
+                                .build();
+
+                ApiResponse<SaldoResponse> apiResp = ApiResponse.success("Balance updated", createSaldoResponse(1L));
+                when(saldoCommandService.updateSaldoBalance(any())).thenReturn(Uni.createFrom().item(apiResp));
+
+                handler.updateSaldoBalance(request).await().indefinitely();
+
+                ArgumentCaptor<com.sanedge.saldo.domain.requests.UpdateSaldoBalance> captor = ArgumentCaptor
+                                .forClass(com.sanedge.saldo.domain.requests.UpdateSaldoBalance.class);
+                verify(saldoCommandService).updateSaldoBalance(captor.capture());
+                assertThat(captor.getValue().getDeltaBalance()).isEqualTo(-25000L);
+                assertThat(captor.getValue().getMinimumBalance()).isEqualTo(10000L);
+                assertThat(captor.getValue().getOperationKey()).isEqualTo("op:test:1");
+        }
+
+        @Test
         @DisplayName("updateSaldoBalance - internal error")
         void updateBalance_Error() {
                 SaldoCommand.UpdateSaldoBalanceRequest request = SaldoCommand.UpdateSaldoBalanceRequest.newBuilder()
@@ -182,6 +207,31 @@ class SaldoCommandGrpcHandlerTest {
                 Saldo.ApiResponseSaldo response = handler.updateSaldoWithdraw(request).await().indefinitely();
                 assertThat(response.getStatus()).isEqualTo("success");
                 assertThat(response.getData().getWithdrawAmount()).isEqualTo(50000);
+        }
+
+        @Test
+        @DisplayName("updateSaldoWithdraw - maps delta fields to domain request")
+        void updateWithdraw_MapsDeltaFields() {
+                SaldoCommand.UpdateSaldoWithdrawRequest request = SaldoCommand.UpdateSaldoWithdrawRequest.newBuilder()
+                                .setCardNumber("1234-5678-9012-3456")
+                                .setWithdrawAmount(50000)
+                                .setWithdrawTime("2024-06-15T10:30:00")
+                                .setDeltaBalance(-50000)
+                                .setMinimumBalance(10000)
+                                .setOperationKey("op:w1")
+                                .build();
+
+                ApiResponse<SaldoResponse> apiResp = ApiResponse.success("Withdraw updated", createSaldoResponse(1L));
+                when(saldoCommandService.updateSaldoWithdraw(any())).thenReturn(Uni.createFrom().item(apiResp));
+
+                handler.updateSaldoWithdraw(request).await().indefinitely();
+
+                ArgumentCaptor<com.sanedge.saldo.domain.requests.UpdateSaldoWithdraw> captor = ArgumentCaptor
+                                .forClass(com.sanedge.saldo.domain.requests.UpdateSaldoWithdraw.class);
+                verify(saldoCommandService).updateSaldoWithdraw(captor.capture());
+                assertThat(captor.getValue().getDeltaBalance()).isEqualTo(-50000L);
+                assertThat(captor.getValue().getMinimumBalance()).isEqualTo(10000L);
+                assertThat(captor.getValue().getOperationKey()).isEqualTo("op:w1");
         }
 
         @Test

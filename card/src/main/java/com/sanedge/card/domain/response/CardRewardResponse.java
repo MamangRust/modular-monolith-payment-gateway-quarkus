@@ -40,8 +40,8 @@ public class CardRewardResponse {
                 .pointsEarned(reward.pointsEarned)
                 .expiresAt(reward.expiresAt != null ? reward.expiresAt.toString() : null)
                 .redeemed(reward.redeemed)
-                .createdAt(reward.getCreatedAt() != null ? reward.getCreatedAt().toString() : null)
-                .updatedAt(reward.getUpdatedAt() != null ? reward.getUpdatedAt().toString() : null)
+                .createdAt(reward.getCreatedAt() != null ? reward.getCreatedAt().toInstant().toString() : null)
+                .updatedAt(reward.getUpdatedAt() != null ? reward.getUpdatedAt().toInstant().toString() : null)
                 .build();
     }
 }

@@ -117,12 +117,32 @@ class SaldoCommandServiceImplTest {
         return r;
     }
 
+    private UpdateSaldoBalance balanceDeltaReq(String card, long delta, long minimum, String operationKey) {
+        UpdateSaldoBalance r = new UpdateSaldoBalance();
+        r.setCardNumber(card);
+        r.setDeltaBalance(delta);
+        r.setMinimumBalance(minimum);
+        r.setOperationKey(operationKey);
+        return r;
+    }
+
     private UpdateSaldoWithdraw withdrawReq(String card, int balance, int amount) {
         UpdateSaldoWithdraw r = new UpdateSaldoWithdraw();
         r.setCardNumber(card);
         r.setTotalBalance((long) balance);
         r.setWithdrawAmount((long) amount);
         r.setWithdrawTime(LocalDateTime.now());
+        return r;
+    }
+
+    private UpdateSaldoWithdraw withdrawDeltaReq(String card, long delta, long minimum, int amount, String operationKey) {
+        UpdateSaldoWithdraw r = new UpdateSaldoWithdraw();
+        r.setCardNumber(card);
+        r.setDeltaBalance(delta);
+        r.setMinimumBalance(minimum);
+        r.setWithdrawAmount((long) amount);
+        r.setWithdrawTime(LocalDateTime.now());
+        r.setOperationKey(operationKey);
         return r;
     }
 
@@ -346,6 +366,41 @@ class SaldoCommandServiceImplTest {
             assertThat(resp.status()).isEqualTo("error");
             assertThat(resp.message()).contains("Saldo not found");
         }
+
+        @Test
+        void deltaAppliesAtomically() {
+            UpdateSaldoBalance req = balanceDeltaReq("card-1", -25000L, 10000L, "op:1");
+            when(saldoCommandRepo.updateBalanceByDelta("card-1", -25000L, 10000L, "op:1"))
+                    .thenReturn(Uni.createFrom().item(1));
+            when(saldoQueryRepo.findByCardNumber("card-1"))
+                    .thenReturn(Uni.createFrom().item(createSaldo(1L, "card-1", 75000)));
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoBalance(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data().getTotalBalance()).isEqualTo(75000);
+        }
+
+        @Test
+        void deltaRejectedWhenBelowMinimum() {
+            UpdateSaldoBalance req = balanceDeltaReq("card-1", -25000L, 10000L, "op:1");
+            when(saldoCommandRepo.updateBalanceByDelta("card-1", -25000L, 10000L, "op:1"))
+                    .thenReturn(Uni.createFrom().item(0));
+            when(saldoQueryRepo.findByCardNumber("card-1"))
+                    .thenReturn(Uni.createFrom().item(createSaldo(1L, "card-1", 5000)));
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoBalance(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Insufficient balance");
+        }
+
+        @Test
+        void deltaWithoutOperationKeyFails() {
+            UpdateSaldoBalance req = balanceDeltaReq("card-1", -25000L, 10000L, null);
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoBalance(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("operation_key");
+        }
     }
 
     @Nested
@@ -379,6 +434,50 @@ class SaldoCommandServiceImplTest {
             ApiResponse<SaldoResponse> resp = service.updateSaldoWithdraw(req).await().indefinitely();
             assertThat(resp.status()).isEqualTo("error");
             assertThat(resp.message()).contains("Saldo not found");
+        }
+
+        @Test
+        void deltaAppliesAtomically() {
+            UpdateSaldoWithdraw req = withdrawDeltaReq("card-1", -50000L, 0L, 50000, "op:w1");
+            when(saldoCommandRepo.updateBalanceByDelta("card-1", -50000L, 0L, "op:w1"))
+                    .thenReturn(Uni.createFrom().item(1));
+            Saldo persisted = new Saldo();
+            persisted.setSaldoId(1L);
+            persisted.setCardNumber("card-1");
+            persisted.setTotalBalance(50000);
+            persisted.setWithdrawAmount(50000);
+            persisted.setWithdrawTime(Timestamp.valueOf(LocalDateTime.now()));
+            when(saldoQueryRepo.findByCardNumber("card-1"))
+                    .thenReturn(Uni.createFrom().item(createSaldo(1L, "card-1", 50000)));
+            when(saldoCommandRepo.persist(any(Saldo.class)))
+                    .thenReturn(Uni.createFrom().item(persisted));
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoWithdraw(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data().getTotalBalance()).isEqualTo(50000);
+            assertThat(resp.data().getWithdrawAmount()).isEqualTo(50000);
+        }
+
+        @Test
+        void deltaRejectedWhenBelowMinimum() {
+            UpdateSaldoWithdraw req = withdrawDeltaReq("card-1", -50000L, 10000L, 50000, "op:w1");
+            when(saldoCommandRepo.updateBalanceByDelta("card-1", -50000L, 10000L, "op:w1"))
+                    .thenReturn(Uni.createFrom().item(0));
+            when(saldoQueryRepo.findByCardNumber("card-1"))
+                    .thenReturn(Uni.createFrom().item(createSaldo(1L, "card-1", 5000)));
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoWithdraw(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Insufficient balance");
+        }
+
+        @Test
+        void deltaWithoutOperationKeyFails() {
+            UpdateSaldoWithdraw req = withdrawDeltaReq("card-1", -50000L, 0L, 50000, null);
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoWithdraw(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("operation_key");
         }
     }
 }

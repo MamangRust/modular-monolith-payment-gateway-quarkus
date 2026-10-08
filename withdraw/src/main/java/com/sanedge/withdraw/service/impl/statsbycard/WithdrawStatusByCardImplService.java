@@ -1,5 +1,6 @@
 package com.sanedge.withdraw.service.impl.statsbycard;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -98,7 +99,7 @@ public class WithdrawStatusByCardImplService implements WithdrawStatusByCardServ
             validateCardNumber(cardNumber);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input: {}", e.getMessage());
-            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:statsbycard:monthly:success:%s:%d:%d", cardNumber, year, month);
@@ -129,11 +130,11 @@ public class WithdrawStatusByCardImplService implements WithdrawStatusByCardServ
 
                                         return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                 .map(v -> ApiResponse.success("Monthly SUCCESS withdraw status by card fetched successfully", response));
-                                    })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch monthly SUCCESS withdraw status by card", e);
-                                        return new ApiResponse<>("error", "Failed to fetch monthly SUCCESS withdraw status by card", null);
                                     }));
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch monthly SUCCESS withdraw status by card", e);
+                    return new ApiResponse<>("error", "Failed to fetch monthly SUCCESS withdraw status by card", Collections.emptyList());
                 });
     }
 
@@ -150,7 +151,7 @@ public class WithdrawStatusByCardImplService implements WithdrawStatusByCardServ
             validateCardNumber(cardNumber);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input: {}", e.getMessage());
-            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:statsbycard:yearly:success:%s:%d", cardNumber, year);
@@ -180,11 +181,11 @@ public class WithdrawStatusByCardImplService implements WithdrawStatusByCardServ
 
                                         return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                 .map(v -> ApiResponse.success("Yearly SUCCESS withdraw status by card fetched successfully", response));
-                                    })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch yearly SUCCESS withdraw status by card", e);
-                                        return new ApiResponse<>("error", "Failed to fetch yearly SUCCESS withdraw status by card", null);
                                     }));
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch yearly SUCCESS withdraw status by card", e);
+                    return new ApiResponse<>("error", "Failed to fetch yearly SUCCESS withdraw status by card", Collections.emptyList());
                 });
     }
 
@@ -203,7 +204,7 @@ public class WithdrawStatusByCardImplService implements WithdrawStatusByCardServ
             validateCardNumber(cardNumber);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input: {}", e.getMessage());
-            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:statsbycard:monthly:failed:%s:%d:%d", cardNumber, year, month);
@@ -234,11 +235,11 @@ public class WithdrawStatusByCardImplService implements WithdrawStatusByCardServ
 
                                         return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                 .map(v -> ApiResponse.success("Monthly FAILED withdraw status by card fetched successfully", response));
-                                    })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch monthly FAILED withdraw status by card", e);
-                                        return new ApiResponse<>("error", "Failed to fetch monthly FAILED withdraw status by card", null);
                                     }));
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch monthly FAILED withdraw status by card", e);
+                    return new ApiResponse<>("error", "Failed to fetch monthly FAILED withdraw status by card", Collections.emptyList());
                 });
     }
 
@@ -255,7 +256,7 @@ public class WithdrawStatusByCardImplService implements WithdrawStatusByCardServ
             validateCardNumber(cardNumber);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input: {}", e.getMessage());
-            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:statsbycard:yearly:failed:%s:%d", cardNumber, year);
@@ -285,11 +286,11 @@ public class WithdrawStatusByCardImplService implements WithdrawStatusByCardServ
 
                                         return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                 .map(v -> ApiResponse.success("Yearly FAILED withdraw status by card fetched successfully", response));
-                                    })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch yearly FAILED withdraw status by card", e);
-                                        return new ApiResponse<>("error", "Failed to fetch yearly FAILED withdraw status by card", null);
                                     }));
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch yearly FAILED withdraw status by card", e);
+                    return new ApiResponse<>("error", "Failed to fetch yearly FAILED withdraw status by card", Collections.emptyList());
                 });
     }
 }

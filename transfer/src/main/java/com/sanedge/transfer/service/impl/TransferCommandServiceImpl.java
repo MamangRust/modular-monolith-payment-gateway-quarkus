@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import com.sanedge.common.config.RedisService;
 import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.common.enums.Status;
+import com.sanedge.common.exception.InvalidRequestException;
 import com.sanedge.common.exception.ResourceNotFoundException;
 import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.transfer.domain.requests.CreateTransferRequest;
@@ -360,7 +361,7 @@ public class TransferCommandServiceImpl implements TransferCommandService {
                         throw new ResourceNotFoundException("Transfer not found with ID " + transferId);
                     }
                     return evictCaches(transfer.getTransferFrom(), transfer.getTransferTo(), transfer.getTransferId())
-                            .map(x -> ApiResponse.success("🗑️ Transfer trashed successfully!",
+                            .map(x -> ApiResponse.success("Transfer trashed successfully!",
                                     TransferResponseDeleteAt.from(transfer)));
                 })
                 .onFailure().recoverWithItem(e -> {
@@ -380,7 +381,7 @@ public class TransferCommandServiceImpl implements TransferCommandService {
                         throw new ResourceNotFoundException("Transfer not found with ID " + transferId);
                     }
                     return evictCaches(transfer.getTransferFrom(), transfer.getTransferTo(), transfer.getTransferId())
-                            .map(x -> ApiResponse.success("♻️ Transfer restored successfully!",
+                            .map(x -> ApiResponse.success("Transfer restored successfully!",
                                     TransferResponseDeleteAt.from(transfer)));
                 })
                 .onFailure().recoverWithItem(e -> {
@@ -396,17 +397,18 @@ public class TransferCommandServiceImpl implements TransferCommandService {
 
         return transferQueryRepository.findTransferById(transferId)
                 .chain(transfer -> {
-                    if (transfer == null) {
-                        return Uni.createFrom().item(ApiResponse.success("🧨 Transfer permanently deleted!", true));
+                    if (transfer == null || transfer.getDeletedAt() == null) {
+                        throw new InvalidRequestException(
+                                "Transfer not found or must be trashed before permanent deletion");
                     }
                     return transferCommandRepository.deletePermanent(transferId)
                             .chain(success -> evictCaches(transfer.getTransferFrom(), transfer.getTransferTo(),
                                     transfer.getTransferId())
-                                    .map(x -> ApiResponse.success("🧨 Transfer permanently deleted!", success)));
+                                    .map(x -> ApiResponse.success("Transfer permanently deleted!", success)));
                 })
                 .onFailure().recoverWithItem(e -> {
                     logger.error("💥 Failed to permanently delete transfer id={}", transferId, e);
-                    return new ApiResponse<>("error", "💥 Failed to permanently delete transfer: " + e.getMessage(),
+                    return new ApiResponse<>("error", "Failed to permanently delete transfer: " + e.getMessage(),
                             false);
                 });
     }
@@ -417,10 +419,14 @@ public class TransferCommandServiceImpl implements TransferCommandService {
         logger.info("🔄 Restoring ALL trashed transfers");
 
         return transferCommandRepository.restoreAllDeleted()
-                .map(success -> ApiResponse.success("🔄 All transfers restored successfully!", success))
-                .onFailure().recoverWithItem(e -> {
+                .map(success -> {
+                    if (!success) {
+                        throw new ResourceNotFoundException("No trashed transfers found");
+                    }
+                    return ApiResponse.success("All transfers restored successfully!", success);
+                })
+                .onFailure().invoke(e -> {
                     logger.error("💥 Failed to restore all transfers", e);
-                    return new ApiResponse<>("error", "💥 Failed to restore all transfers: " + e.getMessage(), false);
                 });
     }
 
@@ -430,10 +436,14 @@ public class TransferCommandServiceImpl implements TransferCommandService {
         logger.info("💣 Permanently deleting ALL trashed transfers");
 
         return transferCommandRepository.deleteAllDeleted()
-                .map(success -> ApiResponse.success("💣 All transfers permanently deleted!", success))
-                .onFailure().recoverWithItem(e -> {
+                .map(success -> {
+                    if (!success) {
+                        throw new ResourceNotFoundException("No trashed transfers found");
+                    }
+                    return ApiResponse.success("All transfers permanently deleted!", success);
+                })
+                .onFailure().invoke(e -> {
                     logger.error("💥 Failed to delete all transfers", e);
-                    return new ApiResponse<>("error", "💥 Failed to delete all transfers: " + e.getMessage(), false);
                 });
     }
 }

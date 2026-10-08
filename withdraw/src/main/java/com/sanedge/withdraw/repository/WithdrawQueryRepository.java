@@ -94,6 +94,11 @@ public class WithdrawQueryRepository implements PanacheRepository<Withdraw> {
     }
 
     public Uni<List<Withdraw>> findPendingCompensation(int maxAttempts) {
-        return find("compensationAttempts < ?1 AND deletedAt IS NULL", maxAttempts).list();
+        // Candidates are records that have been marked for compensation (attempts >= 1),
+        // are not yet terminal (still PENDING), and have not been hard-deleted.
+        // Exhausted records are flipped to FAILED by exhaustCompensation, so they are
+        // excluded by the status filter regardless of the per-record max attempts.
+        return find("compensationAttempts >= 1 AND status = ?1 AND deletedAt IS NULL",
+                com.sanedge.common.enums.Status.PENDING).list();
     }
 }

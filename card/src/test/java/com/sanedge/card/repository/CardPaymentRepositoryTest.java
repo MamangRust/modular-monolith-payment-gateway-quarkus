@@ -2,7 +2,7 @@ package com.sanedge.card.repository;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import java.time.Instant;
+import java.sql.Timestamp;
 
 import org.junit.jupiter.api.Test;
 
@@ -25,8 +25,8 @@ class CardPaymentRepositoryTest {
         CardPayment payment = new CardPayment();
         payment.setCardNumber(cardNumber);
         payment.setStatus(status);
-        payment.setCreatedAt(Instant.now());
-        payment.setUpdatedAt(Instant.now());
+        payment.setCreatedAt(new Timestamp(System.currentTimeMillis()));
+        payment.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
         return repository.persist(payment).map(p -> p);
     }
 

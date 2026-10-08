@@ -49,8 +49,8 @@ public class CardAuthTransactionResponse {
                 .status(txn.status != null ? txn.status.name() : null)
                 .authorizedAt(txn.authorizedAt != null ? txn.authorizedAt.toString() : null)
                 .reversedAt(txn.reversedAt != null ? txn.reversedAt.toString() : null)
-                .createdAt(txn.getCreatedAt() != null ? txn.getCreatedAt().toString() : null)
-                .updatedAt(txn.getUpdatedAt() != null ? txn.getUpdatedAt().toString() : null)
+                .createdAt(txn.getCreatedAt() != null ? txn.getCreatedAt().toInstant().toString() : null)
+                .updatedAt(txn.getUpdatedAt() != null ? txn.getUpdatedAt().toInstant().toString() : null)
                 .build();
     }
 }

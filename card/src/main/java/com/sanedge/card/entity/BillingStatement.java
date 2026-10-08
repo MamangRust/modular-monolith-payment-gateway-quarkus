@@ -1,5 +1,7 @@
 package com.sanedge.card.entity;
 
+import com.sanedge.common.entity.BaseModel;
+
 import java.math.BigDecimal;
 import java.sql.Date;
 

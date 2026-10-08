@@ -1,5 +1,6 @@
 package com.sanedge.withdraw.service.impl.stats;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -76,7 +77,7 @@ public class WithdrawAmountImplService implements WithdrawAmountService {
             validateYear(year);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input year={}", year);
-            return Uni.createFrom().item(new ApiResponse<>("error", "Invalid year provided", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "Invalid year provided", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:stats:monthly:amount:%d", year);
@@ -105,11 +106,11 @@ public class WithdrawAmountImplService implements WithdrawAmountService {
 
                                         return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                 .map(v -> ApiResponse.success("Monthly withdraw amounts retrieved successfully!", response));
-                                    })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch monthly withdraw amounts for year={}", year, e);
-                                        return new ApiResponse<>("error", "Failed to retrieve monthly withdraw amounts", null);
                                     }));
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch monthly withdraw amounts for year={}", year, e);
+                    return new ApiResponse<>("error", "Failed to retrieve monthly withdraw amounts", Collections.emptyList());
                 });
     }
 
@@ -121,7 +122,7 @@ public class WithdrawAmountImplService implements WithdrawAmountService {
             validateYear(year);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input year={}", year);
-            return Uni.createFrom().item(new ApiResponse<>("error", "Invalid year provided", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "Invalid year provided", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:stats:yearly:amount:%d", year);
@@ -150,11 +151,11 @@ public class WithdrawAmountImplService implements WithdrawAmountService {
 
                                         return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                 .map(v -> ApiResponse.success("Yearly withdraw amounts retrieved successfully!", response));
-                                    })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch yearly withdraw amounts until year={}", year, e);
-                                        return new ApiResponse<>("error", "Failed to retrieve yearly withdraw amounts", null);
                                     }));
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch yearly withdraw amounts until year={}", year, e);
+                    return new ApiResponse<>("error", "Failed to retrieve yearly withdraw amounts", Collections.emptyList());
                 });
     }
 }

@@ -7,7 +7,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
 
-import java.time.Instant;
+import java.sql.Timestamp;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Supplier;
@@ -78,8 +78,8 @@ class CardQueryServiceImplTest {
         card.setCardProvider("BCA");
         card.setUserId(100);
         card.setStatus(CardStatus.ACTIVE);
-        card.setCreatedAt(Instant.now());
-        card.setUpdatedAt(Instant.now());
+        card.setCreatedAt(new Timestamp(System.currentTimeMillis()));
+        card.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
         return card;
     }
 

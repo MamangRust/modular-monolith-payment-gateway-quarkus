@@ -1,5 +1,7 @@
 package com.sanedge.transaction.entity;
 
+import com.sanedge.common.entity.BaseModel;
+
 import java.sql.Timestamp;
 import java.util.UUID;
 

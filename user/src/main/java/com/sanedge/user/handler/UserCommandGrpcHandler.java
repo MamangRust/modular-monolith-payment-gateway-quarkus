@@ -140,9 +140,9 @@ public class UserCommandGrpcHandler extends MutinyUserCommandServiceGrpc.UserCom
     private UserResponse mapToUserResponse(com.sanedge.user.domain.response.UserResponse u) {
         return UserResponse.newBuilder()
                 .setId(u.getId().intValue())
-                .setFirstname(u.getFirstname())
-                .setLastname(u.getLastname())
-                .setEmail(u.getEmail())
+                .setFirstname(u.getFirstname() != null ? u.getFirstname() : "")
+                .setLastname(u.getLastname() != null ? u.getLastname() : "")
+                .setEmail(u.getEmail() != null ? u.getEmail() : "")
                 .setCreatedAt(u.getCreatedAt() != null ? u.getCreatedAt().toString() : "")
                 .setUpdatedAt(u.getUpdatedAt() != null ? u.getUpdatedAt().toString() : "")
                 .build();
@@ -151,9 +151,9 @@ public class UserCommandGrpcHandler extends MutinyUserCommandServiceGrpc.UserCom
     private UserResponseDeleteAt mapToUserResponseDeleteAt(com.sanedge.user.domain.response.UserResponseDeleteAt u) {
         UserResponseDeleteAt.Builder builder = UserResponseDeleteAt.newBuilder()
                 .setId(u.getId().intValue())
-                .setFirstname(u.getFirstname())
-                .setLastname(u.getLastname())
-                .setEmail(u.getEmail())
+                .setFirstname(u.getFirstname() != null ? u.getFirstname() : "")
+                .setLastname(u.getLastname() != null ? u.getLastname() : "")
+                .setEmail(u.getEmail() != null ? u.getEmail() : "")
                 .setCreatedAt(u.getCreatedAt() != null ? u.getCreatedAt().toString() : "")
                 .setUpdatedAt(u.getUpdatedAt() != null ? u.getUpdatedAt().toString() : "");
         if (u.getDeletedAt() != null) {

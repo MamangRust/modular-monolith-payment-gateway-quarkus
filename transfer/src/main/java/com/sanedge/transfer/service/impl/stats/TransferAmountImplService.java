@@ -104,10 +104,11 @@ public class TransferAmountImplService implements TransferAmountService {
                                         return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                 .map(v -> ApiResponse.success("Monthly transfer amounts retrieved successfully!", response));
                                     })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch monthly transfer amounts for year={}", year, e);
-                                        return new ApiResponse<>("error", "Failed to retrieve monthly transfer amounts", Collections.emptyList());
-                                    }));
+                                );
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch monthly transfer amounts for year={}", year, e);
+                    return new ApiResponse<>("error", "Failed to retrieve monthly transfer amounts", Collections.emptyList());
                 });
     }
 
@@ -148,10 +149,11 @@ public class TransferAmountImplService implements TransferAmountService {
                                         return redisService.setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                 .map(v -> ApiResponse.success("Yearly transfer amounts retrieved successfully!", response));
                                     })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch yearly transfer amounts until year={}", year, e);
-                                        return new ApiResponse<>("error", "Failed to retrieve yearly transfer amounts", Collections.emptyList());
-                                    }));
+                                );
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch yearly transfer amounts until year={}", year, e);
+                    return new ApiResponse<>("error", "Failed to retrieve yearly transfer amounts", Collections.emptyList());
                 });
     }
 }

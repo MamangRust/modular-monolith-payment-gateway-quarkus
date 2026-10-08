@@ -310,33 +310,72 @@ public class SaldoCommandServiceImpl implements SaldoCommandService {
                 .build();
 
         return tracingMetrics.<ApiResponse<SaldoResponse>>traceAndMeasure(
-                "updateSaldoBalance", "update_saldo_balance", attrs, () ->
+                "updateSaldoBalance", "update_saldo_balance", attrs, () -> {
+                    Uni<ApiResponse<SaldoResponse>> action = request.getDeltaBalance() != null
+                            ? applyBalanceDelta(request)
+                            : overwriteBalance(request);
 
-                saldoQueryRepository.findByCardNumber(request.getCardNumber())
+                    return action.onFailure().recoverWithItem(e -> {
+                        logger.error("💥 Failed to update saldo balance for card_number={}", request.getCardNumber(), e);
+                        return new ApiResponse<>("error", e.getMessage(), null);
+                    });
+                });
+    }
+
+    /**
+     * Atomic path: the balance is mutated by {@code deltaBalance} through the
+     * exactly-once mutation ledger, honouring {@code minimumBalance} and keyed by
+     * {@code operationKey}. Replaying the same key does not re-apply the delta.
+     */
+    private Uni<ApiResponse<SaldoResponse>> applyBalanceDelta(com.sanedge.saldo.domain.requests.UpdateSaldoBalance request) {
+        String operationKey = request.getOperationKey();
+        if (operationKey == null || operationKey.isBlank()) {
+            return Uni.createFrom().failure(
+                    new InvalidRequestException("operation_key is required for delta balance updates"));
+        }
+
+        long minimumBalance = request.getMinimumBalance() != null ? request.getMinimumBalance() : 0L;
+
+        return saldoCommandRepository
+                .updateBalanceByDelta(request.getCardNumber(), request.getDeltaBalance(), minimumBalance, operationKey)
+                .chain(applied -> saldoQueryRepository.findByCardNumber(request.getCardNumber())
                         .chain(saldo -> {
                             if (saldo == null) {
                                 logger.error("Saldo not found for card {}", request.getCardNumber());
                                 throw new ResourceNotFoundException("Saldo not found");
                             }
+                            if (applied == null || applied == 0) {
+                                throw new InvalidRequestException("Insufficient balance");
+                            }
 
-                            saldo.setTotalBalance(request.getTotalBalance().intValue());
-                            saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
-
-                            return saldoCommandRepository.persist(saldo)
-                                    .chain(savedSaldo -> {
-                                        String cacheId = "saldo:id:" + savedSaldo.getSaldoId();
-                                        String cacheCard = "saldo:card:" + request.getCardNumber();
-
-                                        return Uni.combine().all().unis(
-                                                redisService.deleteReactive(cacheId),
-                                                redisService.deleteReactive(cacheCard)
-                                        ).asTuple().map(t -> ApiResponse.success("Update saldo balance success", SaldoResponse.from(savedSaldo)));
-                                    });
-                        })
-                        .onFailure().recoverWithItem(e -> {
-                            logger.error("💥 Failed to update saldo balance for card_number={}", request.getCardNumber(), e);
-                            return new ApiResponse<>("error", e.getMessage(), null);
+                            return evictSaldoCaches(request.getCardNumber(), saldo.getSaldoId())
+                                    .map(v -> ApiResponse.success("Update saldo balance success", SaldoResponse.from(saldo)));
                         }));
+    }
+
+    /** Direct overwrite path: writes {@code totalBalance} verbatim. */
+    private Uni<ApiResponse<SaldoResponse>> overwriteBalance(com.sanedge.saldo.domain.requests.UpdateSaldoBalance request) {
+        return saldoQueryRepository.findByCardNumber(request.getCardNumber())
+                .chain(saldo -> {
+                    if (saldo == null) {
+                        logger.error("Saldo not found for card {}", request.getCardNumber());
+                        throw new ResourceNotFoundException("Saldo not found");
+                    }
+
+                    saldo.setTotalBalance(request.getTotalBalance().intValue());
+                    saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+
+                    return saldoCommandRepository.persist(saldo)
+                            .chain(savedSaldo -> evictSaldoCaches(request.getCardNumber(), savedSaldo.getSaldoId())
+                                    .map(v -> ApiResponse.success("Update saldo balance success", SaldoResponse.from(savedSaldo))));
+                });
+    }
+
+    private Uni<Void> evictSaldoCaches(String cardNumber, long saldoId) {
+        return Uni.combine().all().unis(
+                redisService.deleteReactive("saldo:id:" + saldoId),
+                redisService.deleteReactive("saldo:card:" + cardNumber)
+        ).asTuple().replaceWithVoid();
     }
 
     @Override
@@ -351,38 +390,79 @@ public class SaldoCommandServiceImpl implements SaldoCommandService {
                 .build();
 
         return tracingMetrics.<ApiResponse<SaldoResponse>>traceAndMeasure(
-                "updateSaldoWithdraw", "update_saldo_withdraw", attrs, () ->
+                "updateSaldoWithdraw", "update_saldo_withdraw", attrs, () -> {
+                    Uni<ApiResponse<SaldoResponse>> action = request.getDeltaBalance() != null
+                            ? applyWithdrawDelta(request)
+                            : overwriteWithdraw(request);
 
-                saldoQueryRepository.findByCardNumber(request.getCardNumber())
+                    return action.onFailure().recoverWithItem(e -> {
+                        logger.error("💥 Failed to update saldo withdraw for card_number={}", request.getCardNumber(), e);
+                        return new ApiResponse<>("error", e.getMessage(), null);
+                    });
+                });
+    }
+
+    /**
+     * Atomic path: the balance is debited by {@code deltaBalance} through the
+     * exactly-once mutation ledger, then the withdraw amount/time are recorded.
+     * Replaying the same {@code operationKey} does not re-apply the debit.
+     */
+    private Uni<ApiResponse<SaldoResponse>> applyWithdrawDelta(com.sanedge.saldo.domain.requests.UpdateSaldoWithdraw request) {
+        String operationKey = request.getOperationKey();
+        if (operationKey == null || operationKey.isBlank()) {
+            return Uni.createFrom().failure(
+                    new InvalidRequestException("operation_key is required for delta withdraw updates"));
+        }
+
+        long minimumBalance = request.getMinimumBalance() != null ? request.getMinimumBalance() : 0L;
+
+        return saldoCommandRepository
+                .updateBalanceByDelta(request.getCardNumber(), request.getDeltaBalance(), minimumBalance, operationKey)
+                .chain(applied -> saldoQueryRepository.findByCardNumber(request.getCardNumber())
                         .chain(saldo -> {
                             if (saldo == null) {
                                 logger.error("Saldo not found for card {}", request.getCardNumber());
                                 throw new ResourceNotFoundException("Saldo not found");
                             }
-
-                            saldo.setTotalBalance(request.getTotalBalance().intValue());
-                            saldo.setWithdrawAmount(request.getWithdrawAmount().intValue());
-                            if (request.getWithdrawTime() != null) {
-                                saldo.setWithdrawTime(java.sql.Timestamp.valueOf(request.getWithdrawTime()));
-                            } else {
-                                saldo.setWithdrawTime(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                            if (applied == null || applied == 0) {
+                                throw new InvalidRequestException("Insufficient balance");
                             }
+
+                            if (request.getWithdrawAmount() != null) {
+                                saldo.setWithdrawAmount(request.getWithdrawAmount().intValue());
+                            }
+                            saldo.setWithdrawTime(request.getWithdrawTime() != null
+                                    ? java.sql.Timestamp.valueOf(request.getWithdrawTime())
+                                    : java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
                             saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
 
                             return saldoCommandRepository.persist(saldo)
-                                    .chain(savedSaldo -> {
-                                        String cacheId = "saldo:id:" + savedSaldo.getSaldoId();
-                                        String cacheCard = "saldo:card:" + request.getCardNumber();
-
-                                        return Uni.combine().all().unis(
-                                                redisService.deleteReactive(cacheId),
-                                                redisService.deleteReactive(cacheCard)
-                                        ).asTuple().map(t -> ApiResponse.success("Update saldo withdraw success", SaldoResponse.from(savedSaldo)));
-                                    });
-                        })
-                        .onFailure().recoverWithItem(e -> {
-                            logger.error("💥 Failed to update saldo withdraw for card_number={}", request.getCardNumber(), e);
-                            return new ApiResponse<>("error", e.getMessage(), null);
+                                    .chain(savedSaldo -> evictSaldoCaches(request.getCardNumber(), savedSaldo.getSaldoId())
+                                            .map(v -> ApiResponse.success("Update saldo withdraw success", SaldoResponse.from(savedSaldo))));
                         }));
+    }
+
+    /** Direct overwrite path: writes {@code totalBalance} and withdraw fields verbatim. */
+    private Uni<ApiResponse<SaldoResponse>> overwriteWithdraw(com.sanedge.saldo.domain.requests.UpdateSaldoWithdraw request) {
+        return saldoQueryRepository.findByCardNumber(request.getCardNumber())
+                .chain(saldo -> {
+                    if (saldo == null) {
+                        logger.error("Saldo not found for card {}", request.getCardNumber());
+                        throw new ResourceNotFoundException("Saldo not found");
+                    }
+
+                    saldo.setTotalBalance(request.getTotalBalance().intValue());
+                    saldo.setWithdrawAmount(request.getWithdrawAmount().intValue());
+                    if (request.getWithdrawTime() != null) {
+                        saldo.setWithdrawTime(java.sql.Timestamp.valueOf(request.getWithdrawTime()));
+                    } else {
+                        saldo.setWithdrawTime(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+                    }
+                    saldo.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
+
+                    return saldoCommandRepository.persist(saldo)
+                            .chain(savedSaldo -> evictSaldoCaches(request.getCardNumber(), savedSaldo.getSaldoId())
+                                    .map(v -> ApiResponse.success("Update saldo withdraw success", SaldoResponse.from(savedSaldo))));
+                });
     }
 }

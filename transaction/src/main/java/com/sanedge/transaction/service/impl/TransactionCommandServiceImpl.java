@@ -434,8 +434,9 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
                                                                                                         transactionId,
                                                                                                         Status.FAILED.toString())
                                                                                         .chain(v -> Uni.createFrom()
-                                                                                                        .failure(new ResourceNotFoundException(
-                                                                                                                        "unauthorized access")));
+                                                                                                        .<ApiResponse<TransactionResponse>>failure(
+                                                                                                                        new ResourceNotFoundException(
+                                                                                                                                "unauthorized access")));
                                                                 }
 
                                                                 return cardQueryService.findByCardNumber(
@@ -498,7 +499,7 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
                                                                                                                                                                                 transactionId,
                                                                                                                                                                                 Status.FAILED.toString())
                                                                                                                                                                 .chain(v2 -> Uni.createFrom()
-                                                                                                                                                                                .failure(
+                                                                                                                                                                                .<ApiResponse<TransactionResponse>>failure(
                                                                                                                                                                                                 new ResourceNotFoundException(
                                                                                                                                                                                                                 "Insufficient balance")));
                                                                                                                                         }

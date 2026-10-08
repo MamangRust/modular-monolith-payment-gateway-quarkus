@@ -2,13 +2,11 @@ package com.sanedge.user.service.impl;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.when;
 
-import java.sql.Timestamp;
-import java.time.LocalDateTime;
-import java.util.HashSet;
 import java.util.function.Supplier;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -33,7 +31,6 @@ import com.sanedge.user.repository.UserRepository;
 
 import io.opentelemetry.api.common.Attributes;
 import io.smallrye.mutiny.Uni;
-import pb.role.RoleService;
 
 @ExtendWith(MockitoExtension.class)
 class UserCommandServiceImplTest {
@@ -51,7 +48,7 @@ class UserCommandServiceImplTest {
     private TracingMetrics tracingMetrics;
 
     @Mock
-    private RoleService roleService;
+    private pb.role.RoleService roleQueryService;
 
     private UserCommandServiceImpl userCommandService;
 
@@ -63,12 +60,14 @@ class UserCommandServiceImplTest {
                 redisService,
                 tracingMetrics);
 
+        // Inject @GrpcClient fields via reflection
         try {
-            java.lang.reflect.Field roleQueryField = UserCommandServiceImpl.class.getDeclaredField("roleQueryService");
+            java.lang.reflect.Field roleQueryField = UserCommandServiceImpl.class
+                    .getDeclaredField("roleQueryService");
             roleQueryField.setAccessible(true);
-            roleQueryField.set(userCommandService, roleService);
+            roleQueryField.set(userCommandService, roleQueryService);
         } catch (Exception e) {
-            throw new RuntimeException(e);
+            throw new RuntimeException("Failed to inject role gRPC mocks", e);
         }
 
         lenient().doAnswer(invocation -> {
@@ -142,7 +141,7 @@ class UserCommandServiceImplTest {
     }
 
     @Test
-    void createUser_success_withoutRoles_createsDefaultUser() {
+    void createUser_success_createsDefaultUser() {
         RegisterRequest request = new RegisterRequest();
         request.setUsername("newuser");
         request.setPassword("password123");
@@ -152,20 +151,20 @@ class UserCommandServiceImplTest {
         request.setLastname("Doe");
 
         pb.role.RoleQuery.FindByNameRoleRequest requestProto = pb.role.RoleQuery.FindByNameRoleRequest.newBuilder()
-                .setName("ROLE_USER")
+                .setName("ROLE_ADMIN")
                 .build();
         pb.role.Role.ApiResponseRole responseProto = pb.role.Role.ApiResponseRole.newBuilder()
                 .setStatus("success")
                 .setMessage("Role found")
                 .setData(pb.role.Role.RoleResponse.newBuilder()
                         .setId(1)
-                        .setName("ROLE_USER")
+                        .setName("ROLE_ADMIN")
                         .build())
                 .build();
 
-        lenient().when(roleService.findByNameRole(requestProto)).thenReturn(Uni.createFrom().item(responseProto));
+        when(roleQueryService.findByNameRole(requestProto)).thenReturn(Uni.createFrom().item(responseProto));
 
-        lenient().when(userRepository.persist(any(User.class))).thenAnswer(invocation -> {
+        when(userRepository.persist(any(User.class))).thenAnswer(invocation -> {
             User userToPersist = invocation.getArgument(0);
             userToPersist.id = 1L;
             return Uni.createFrom().item(userToPersist);
@@ -184,7 +183,7 @@ class UserCommandServiceImplTest {
     }
 
     @Test
-    void updateUser_userNotFound_throwsResourceNotFoundException() {
+    void updateUser_userNotFound_returnsErrorResponse() {
         UpdateUserRequest request = UpdateUserRequest.builder()
                 .id(999)
                 .firstname("Updated")
@@ -192,12 +191,10 @@ class UserCommandServiceImplTest {
 
         when(userRepository.findById(999)).thenReturn(Uni.createFrom().nullItem());
 
-        try {
-            userCommandService.updateUser(request).await().indefinitely();
-            org.junit.jupiter.api.Assertions.fail("Expected ResourceNotFoundException");
-        } catch (ResourceNotFoundException e) {
-            assertThat(e.getMessage()).contains("User not found");
-        }
+        ApiResponse<UserResponse> response = userCommandService.updateUser(request).await().indefinitely();
+
+        assertThat(response.status()).isEqualTo("error");
+        assertThat(response.message()).contains("User not found");
     }
 
     @Test
@@ -209,8 +206,6 @@ class UserCommandServiceImplTest {
         existingUser.setFirstname("Old");
         existingUser.setLastname("Name");
         existingUser.setPassword("hashedPassword");
-        existingUser.setRoles(new HashSet<>());
-        existingUser.setCreatedAt(Timestamp.valueOf(LocalDateTime.now()));
 
         UpdateUserRequest request = UpdateUserRequest.builder()
                 .id(1)
@@ -232,7 +227,7 @@ class UserCommandServiceImplTest {
     }
 
     @Test
-    void updateUser_passwordMismatch_throwsInvalidRequestException() {
+    void updateUser_passwordMismatch_returnsErrorResponse() {
         User existingUser = new User();
         existingUser.id = 1L;
         existingUser.setUsername("testuser");
@@ -240,7 +235,6 @@ class UserCommandServiceImplTest {
         existingUser.setFirstname("John");
         existingUser.setLastname("Doe");
         existingUser.setPassword("hashedPassword");
-        existingUser.setRoles(new HashSet<>());
 
         UpdateUserRequest request = UpdateUserRequest.builder()
                 .id(1)
@@ -250,24 +244,20 @@ class UserCommandServiceImplTest {
 
         when(userRepository.findById(1)).thenReturn(Uni.createFrom().item(existingUser));
 
-        try {
-            userCommandService.updateUser(request).await().indefinitely();
-            org.junit.jupiter.api.Assertions.fail("Expected InvalidRequestException");
-        } catch (InvalidRequestException e) {
-            assertThat(e.getMessage()).isEqualTo("Passwords do not match");
-        }
+        ApiResponse<UserResponse> response = userCommandService.updateUser(request).await().indefinitely();
+
+        assertThat(response.status()).isEqualTo("error");
+        assertThat(response.message()).contains("Passwords do not match");
     }
 
     @Test
-    void trashUser_userNotFound_throwsResourceNotFoundException() {
+    void trashUser_userNotFound_returnsErrorResponse() {
         when(userRepository.trash(999L)).thenReturn(Uni.createFrom().nullItem());
 
-        try {
-            userCommandService.trashed(999L).await().indefinitely();
-            org.junit.jupiter.api.Assertions.fail("Expected ResourceNotFoundException");
-        } catch (ResourceNotFoundException e) {
-            assertThat(e.getMessage()).contains("Trashed user not found");
-        }
+        ApiResponse<UserResponseDeleteAt> response = userCommandService.trashed(999L).await().indefinitely();
+
+        assertThat(response.status()).isEqualTo("error");
+        assertThat(response.message()).contains("Trashed user not found");
     }
 
     @Test
@@ -278,7 +268,7 @@ class UserCommandServiceImplTest {
         trashedUser.setEmail("test@example.com");
         trashedUser.setFirstname("John");
         trashedUser.setLastname("Doe");
-        trashedUser.setDeletedAt(Timestamp.valueOf(LocalDateTime.now()));
+        trashedUser.setCreatedAt(new java.sql.Timestamp(System.currentTimeMillis()));
 
         when(userRepository.trash(1L)).thenReturn(Uni.createFrom().item(trashedUser));
         lenient().when(redisService.deleteReactive("user:1")).thenReturn(Uni.createFrom().voidItem());
@@ -291,15 +281,13 @@ class UserCommandServiceImplTest {
     }
 
     @Test
-    void restoreUser_userNotFound_throwsInvalidRequestException() {
+    void restoreUser_userNotFound_returnsErrorResponse() {
         when(userRepository.restore(999L)).thenReturn(Uni.createFrom().nullItem());
 
-        try {
-            userCommandService.restore(999L).await().indefinitely();
-            org.junit.jupiter.api.Assertions.fail("Expected InvalidRequestException");
-        } catch (InvalidRequestException e) {
-            assertThat(e.getMessage()).isEqualTo("User not found or must be trashed first");
-        }
+        ApiResponse<UserResponseDeleteAt> response = userCommandService.restore(999L).await().indefinitely();
+
+        assertThat(response.status()).isEqualTo("error");
+        assertThat(response.message()).contains("Restore user not found");
     }
 
     @Test
@@ -327,6 +315,7 @@ class UserCommandServiceImplTest {
         deletedUser.id = 1L;
         deletedUser.setUsername("testuser");
 
+        when(userRepository.findById(1L)).thenReturn(Uni.createFrom().item(deletedUser));
         when(userRepository.deletePermanent(1L)).thenReturn(Uni.createFrom().item(deletedUser));
         when(redisService.deleteReactive("user:1")).thenReturn(Uni.createFrom().voidItem());
 

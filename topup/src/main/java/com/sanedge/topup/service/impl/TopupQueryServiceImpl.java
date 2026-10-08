@@ -510,7 +510,7 @@ public class TopupQueryServiceImpl implements TopupQueryService {
                                         AttributeKey.stringKey("status"), "failed",
                                         AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
 
-                                return new ApiResponse<>("error", "Failed to fetch topup id=" + topupId, null);
+                                return new ApiResponse<>("error", "Failed to fetch topup id=" + topupId + ": " + e.getMessage(), null);
                             })
                             .eventually(() -> {
                                 span.end();

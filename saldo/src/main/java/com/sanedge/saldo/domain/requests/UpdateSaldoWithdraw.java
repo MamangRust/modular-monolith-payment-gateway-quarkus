@@ -21,4 +21,13 @@ public class UpdateSaldoWithdraw {
     private Long withdrawAmount;
 
     private LocalDateTime withdrawTime;
+
+    /** When set, the balance is debited atomically by this delta instead of being overwritten. */
+    private Long deltaBalance;
+
+    /** Floor the resulting balance must not drop below; only used with {@link #deltaBalance}. */
+    private Long minimumBalance;
+
+    /** Idempotency key for the atomic delta debit; only used with {@link #deltaBalance}. */
+    private String operationKey;
 }

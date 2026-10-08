@@ -10,7 +10,7 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
-import java.time.Instant;
+import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.util.HashSet;
 import java.util.Set;
@@ -107,8 +107,8 @@ class CardCommandImplServiceTest {
         card.setCardProvider("BCA");
         card.setUserId(100);
         card.setStatus(CardStatus.ACTIVE);
-        card.setCreatedAt(Instant.now());
-        card.setUpdatedAt(Instant.now());
+        card.setCreatedAt(new Timestamp(System.currentTimeMillis()));
+        card.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
         return card;
     }
 
@@ -221,7 +221,7 @@ class CardCommandImplServiceTest {
         @Test
         void success() {
             Card trashed = createMockCard(1L);
-            trashed.setDeletedAt(Instant.now());
+            trashed.setDeletedAt(new Timestamp(System.currentTimeMillis()));
             when(cardCommandRepository.trashed(1L)).thenReturn(Uni.createFrom().item(trashed));
 
             ApiResponse<CardResponseDeleteAt> resp = service.trashCard(1L).await().indefinitely();

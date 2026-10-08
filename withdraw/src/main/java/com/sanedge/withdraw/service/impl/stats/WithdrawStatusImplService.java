@@ -1,6 +1,7 @@
 package com.sanedge.withdraw.service.impl.stats;
 
 import java.time.LocalDate;
+import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -89,7 +90,7 @@ public class WithdrawStatusImplService implements WithdrawStatusService {
             validateYearMonth(year, month);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input: {}", e.getMessage());
-            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:stats:monthly:success:%d:%d", year, month);
@@ -128,12 +129,12 @@ public class WithdrawStatusImplService implements WithdrawStatusService {
                                                     .setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                     .map(v -> ApiResponse.success(
                                                             "Monthly SUCCESS withdraw status fetched successfully", response));
-                                        })
-                                        .onFailure().recoverWithItem(e -> {
-                                            logger.error("❌ Failed to fetch monthly SUCCESS withdraw status", e);
-                                            return new ApiResponse<>("error", "Failed to fetch monthly SUCCESS withdraw status", null);
                                         });
                             });
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch monthly SUCCESS withdraw status", e);
+                    return new ApiResponse<>("error", "Failed to fetch monthly SUCCESS withdraw status", Collections.emptyList());
                 });
     }
 
@@ -145,7 +146,7 @@ public class WithdrawStatusImplService implements WithdrawStatusService {
             validateYear(year);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input: {}", e.getMessage());
-            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:stats:yearly:success:%d", year);
@@ -178,11 +179,11 @@ public class WithdrawStatusImplService implements WithdrawStatusService {
                                                 .setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                 .map(v -> ApiResponse.success(
                                                         "Yearly SUCCESS withdraw status fetched successfully", response));
-                                    })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch yearly SUCCESS withdraw status", e);
-                                        return new ApiResponse<>("error", "Failed to fetch yearly SUCCESS withdraw status", null);
                                     }));
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch yearly SUCCESS withdraw status", e);
+                    return new ApiResponse<>("error", "Failed to fetch yearly SUCCESS withdraw status", Collections.emptyList());
                 });
     }
 
@@ -197,7 +198,7 @@ public class WithdrawStatusImplService implements WithdrawStatusService {
             validateYearMonth(year, month);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input: {}", e.getMessage());
-            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:stats:monthly:failed:%d:%d", year, month);
@@ -236,12 +237,12 @@ public class WithdrawStatusImplService implements WithdrawStatusService {
                                                     .setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                     .map(v -> ApiResponse.success(
                                                             "Monthly FAILED withdraw status fetched successfully", response));
-                                        })
-                                        .onFailure().recoverWithItem(e -> {
-                                            logger.error("❌ Failed to fetch monthly FAILED withdraw status", e);
-                                            return new ApiResponse<>("error", "Failed to fetch monthly FAILED withdraw status", null);
                                         });
                             });
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch monthly FAILED withdraw status", e);
+                    return new ApiResponse<>("error", "Failed to fetch monthly FAILED withdraw status", Collections.emptyList());
                 });
     }
 
@@ -253,7 +254,7 @@ public class WithdrawStatusImplService implements WithdrawStatusService {
             validateYear(year);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input: {}", e.getMessage());
-            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:stats:yearly:failed:%d", year);
@@ -286,11 +287,11 @@ public class WithdrawStatusImplService implements WithdrawStatusService {
                                                 .setWithExpirationReactive(cacheKey, toJson(response), STATS_CACHE_TTL_SECONDS)
                                                 .map(v -> ApiResponse.success(
                                                         "Yearly FAILED withdraw status fetched successfully", response));
-                                    })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch yearly FAILED withdraw status", e);
-                                        return new ApiResponse<>("error", "Failed to fetch yearly FAILED withdraw status", null);
                                     }));
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch yearly FAILED withdraw status", e);
+                    return new ApiResponse<>("error", "Failed to fetch yearly FAILED withdraw status", Collections.emptyList());
                 });
     }
 }

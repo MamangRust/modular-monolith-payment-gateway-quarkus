@@ -77,7 +77,7 @@ public class TransferAmountByCardImplService implements TransferAmountByCardServ
 
         if (!isValidYearAndCard(year, cardNumber)) {
             logger.error("❌ Invalid year or cardNumber provided: year={}, cardNumber={}", year, cardNumber);
-            return Uni.createFrom().item(new ApiResponse<>("failed", "Invalid input parameters", Collections.emptyList()));
+            return Uni.createFrom().item(new ApiResponse<>("error", "Invalid input parameters", Collections.emptyList()));
         }
 
         String cacheKey = String.format("transfers:statsbycard:amount:month:sender:%s:%d", cardNumber, year);
@@ -111,7 +111,7 @@ public class TransferAmountByCardImplService implements TransferAmountByCardServ
                                     })
                                     .onFailure().recoverWithItem(e -> {
                                         logger.error("❌ Failed to fetch monthly transfer amounts (sender) for year={}, cardNumber={}", year, cardNumber, e);
-                                        return new ApiResponse<>("failed", "Failed to fetch monthly transfer amounts (sender)", Collections.emptyList());
+                                        return new ApiResponse<>("error", "Failed to fetch monthly transfer amounts (sender)", Collections.emptyList());
                                     }));
                 });
     }
@@ -125,7 +125,7 @@ public class TransferAmountByCardImplService implements TransferAmountByCardServ
 
         if (!isValidYearAndCard(year, cardNumber)) {
             logger.error("❌ Invalid year or cardNumber provided: year={}, cardNumber={}", year, cardNumber);
-            return Uni.createFrom().item(new ApiResponse<>("failed", "Invalid input parameters", Collections.emptyList()));
+            return Uni.createFrom().item(new ApiResponse<>("error", "Invalid input parameters", Collections.emptyList()));
         }
 
         String cacheKey = String.format("transfers:statsbycard:amount:month:receiver:%s:%d", cardNumber, year);
@@ -159,7 +159,7 @@ public class TransferAmountByCardImplService implements TransferAmountByCardServ
                                     })
                                     .onFailure().recoverWithItem(e -> {
                                         logger.error("❌ Failed to fetch monthly transfer amounts (receiver) for year={}, cardNumber={}", year, cardNumber, e);
-                                        return new ApiResponse<>("failed", "Failed to fetch monthly transfer amounts (receiver)", Collections.emptyList());
+                                        return new ApiResponse<>("error", "Failed to fetch monthly transfer amounts (receiver)", Collections.emptyList());
                                     }));
                 });
     }
@@ -173,7 +173,7 @@ public class TransferAmountByCardImplService implements TransferAmountByCardServ
 
         if (!isValidYearAndCard(year, cardNumber)) {
             logger.error("❌ Invalid year or cardNumber provided: year={}, cardNumber={}", year, cardNumber);
-            return Uni.createFrom().item(new ApiResponse<>("failed", "Invalid input parameters", Collections.emptyList()));
+            return Uni.createFrom().item(new ApiResponse<>("error", "Invalid input parameters", Collections.emptyList()));
         }
 
         String cacheKey = String.format("transfers:statsbycard:amount:year:sender:%s:%d", cardNumber, year);
@@ -207,7 +207,7 @@ public class TransferAmountByCardImplService implements TransferAmountByCardServ
                                     })
                                     .onFailure().recoverWithItem(e -> {
                                         logger.error("❌ Failed to fetch yearly transfer amounts (sender) until year={}, cardNumber={}", year, cardNumber, e);
-                                        return new ApiResponse<>("failed", "Failed to fetch yearly transfer amounts (sender)", Collections.emptyList());
+                                        return new ApiResponse<>("error", "Failed to fetch yearly transfer amounts (sender)", Collections.emptyList());
                                     }));
                 });
     }
@@ -221,7 +221,7 @@ public class TransferAmountByCardImplService implements TransferAmountByCardServ
 
         if (!isValidYearAndCard(year, cardNumber)) {
             logger.error("❌ Invalid year or cardNumber provided: year={}, cardNumber={}", year, cardNumber);
-            return Uni.createFrom().item(new ApiResponse<>("failed", "Invalid input parameters", Collections.emptyList()));
+            return Uni.createFrom().item(new ApiResponse<>("error", "Invalid input parameters", Collections.emptyList()));
         }
 
         String cacheKey = String.format("transfers:statsbycard:amount:year:receiver:%s:%d", cardNumber, year);
@@ -255,7 +255,7 @@ public class TransferAmountByCardImplService implements TransferAmountByCardServ
                                     })
                                     .onFailure().recoverWithItem(e -> {
                                         logger.error("❌ Failed to fetch yearly transfer amounts (receiver) until year={}, cardNumber={}", year, cardNumber, e);
-                                        return new ApiResponse<>("failed", "Failed to fetch yearly transfer amounts (receiver)", Collections.emptyList());
+                                        return new ApiResponse<>("error", "Failed to fetch yearly transfer amounts (receiver)", Collections.emptyList());
                                     }));
                 });
     }

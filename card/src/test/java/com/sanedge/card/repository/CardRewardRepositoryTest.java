@@ -3,7 +3,7 @@ package com.sanedge.card.repository;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.math.BigDecimal;
-import java.time.Instant;
+import java.sql.Timestamp;
 
 import org.junit.jupiter.api.Test;
 
@@ -27,8 +27,8 @@ class CardRewardRepositoryTest {
         reward.setCardNumber(cardNumber);
         reward.setPointsEarned(points);
         reward.setRedeemed(redeemed);
-        reward.setCreatedAt(Instant.now());
-        reward.setUpdatedAt(Instant.now());
+        reward.setCreatedAt(new Timestamp(System.currentTimeMillis()));
+        reward.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
         return repository.persist(reward).map(r -> r);
     }
 

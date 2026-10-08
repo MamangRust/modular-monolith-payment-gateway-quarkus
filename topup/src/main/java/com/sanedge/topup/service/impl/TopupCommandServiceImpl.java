@@ -14,6 +14,7 @@ import com.sanedge.topup.domain.response.TopupResponse;
 import com.sanedge.topup.domain.response.TopupResponseDeleteAt;
 import com.sanedge.topup.entity.Topup;
 import com.sanedge.common.enums.Status;
+import com.sanedge.common.exception.InvalidRequestException;
 import com.sanedge.common.exception.ResourceNotFoundException;
 import pb.card.CardQueryService;
 import pb.saldo.SaldoQueryService;
@@ -492,6 +493,11 @@ public class TopupCommandServiceImpl implements TopupCommandService {
                         throw new ResourceNotFoundException("Topup not found");
                     }
 
+                    if (topup.getDeletedAt() == null) {
+                        logger.error("Topup {} is not trashed, cannot delete permanently", topupId);
+                        throw new InvalidRequestException("Topup must be trashed first");
+                    }
+
                     String topupCardCache = "topups:card:" + topup.getCardNumber();
                     String topupIdCache = "topup:id:" + topupId;
 
@@ -542,6 +548,9 @@ public class TopupCommandServiceImpl implements TopupCommandService {
 
         return topupCommandRepository.restoreAllDeleted()
                 .map(restored -> {
+                    if (!restored) {
+                        throw new ResourceNotFoundException("No trashed topups");
+                    }
                     span.setStatus(StatusCode.OK);
                     requestsTotal.add(1, Attributes.of(
                             AttributeKey.stringKey("operation"), "restore_all_topups",
@@ -549,17 +558,8 @@ public class TopupCommandServiceImpl implements TopupCommandService {
 
                     return ApiResponse.success("Restored all trashed topups", restored);
                 })
-                .onFailure().recoverWithItem(e -> {
+                .onFailure().invoke(e -> {
                     logger.error("💥 Failed to restore all topups", e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "restore_all_topups",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", e.getMessage(), false);
                 })
                 .eventually(() -> {
                     span.end();
@@ -583,6 +583,9 @@ public class TopupCommandServiceImpl implements TopupCommandService {
 
         return topupCommandRepository.deleteAllDeleted()
                 .map(deleted -> {
+                    if (!deleted) {
+                        throw new ResourceNotFoundException("No trashed topups");
+                    }
                     span.setStatus(StatusCode.OK);
                     requestsTotal.add(1, Attributes.of(
                             AttributeKey.stringKey("operation"), "delete_all_topups",
@@ -590,17 +593,8 @@ public class TopupCommandServiceImpl implements TopupCommandService {
 
                     return ApiResponse.success("Deleted all trashed topups", deleted);
                 })
-                .onFailure().recoverWithItem(e -> {
+                .onFailure().invoke(e -> {
                     logger.error("💥 Failed to delete all topups", e);
-                    span.recordException(e);
-                    span.setStatus(StatusCode.ERROR, e.getMessage());
-
-                    requestsTotal.add(1, Attributes.of(
-                            AttributeKey.stringKey("operation"), "delete_all_topups",
-                            AttributeKey.stringKey("status"), "failed",
-                            AttributeKey.stringKey("error_type"), e.getClass().getSimpleName()));
-
-                    return new ApiResponse<>("error", e.getMessage(), false);
                 })
                 .eventually(() -> {
                     span.end();

@@ -15,6 +15,7 @@ import com.sanedge.withdraw.domain.response.WithdrawResponse;
 import com.sanedge.withdraw.domain.response.WithdrawResponseDeleteAt;
 import com.sanedge.withdraw.entity.Withdraw;
 import com.sanedge.common.enums.Status;
+import com.sanedge.common.exception.InvalidRequestException;
 import com.sanedge.common.exception.ResourceNotFoundException;
 import com.sanedge.common.observability.TracingMetrics;
 import pb.card.CardQueryService;
@@ -303,14 +304,10 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
         return withdrawCommandRepository.restore(withdrawId)
                 .chain(withdraw -> {
                     if (withdraw == null) {
-                        throw new ResourceNotFoundException("Withdraw not found with ID " + withdrawId);
+                        throw new InvalidRequestException("Withdraw with id=" + withdrawId + " must be trashed first");
                     }
                     return evictCaches(withdraw.getCardNumber(), withdraw.getWithdrawId())
                             .map(v -> ApiResponse.success("Withdraw restored successfully!", WithdrawResponseDeleteAt.from(withdraw)));
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to restore withdraw id={}", withdrawId, e);
-                    return new ApiResponse<>("error", "Failed to restore withdraw: " + e.getMessage(), null);
                 });
     }
 
@@ -321,16 +318,13 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
 
         return withdrawQueryRepository.findById(withdrawId)
                 .chain(withdraw -> {
-                    if (withdraw == null) {
-                        return Uni.createFrom().item(ApiResponse.success("Withdraw permanently deleted!", true));
+                    if (withdraw == null || withdraw.getDeletedAt() == null) {
+                        throw new InvalidRequestException(
+                                "Withdraw not found or must be trashed before permanent deletion");
                     }
                     return withdrawCommandRepository.deletePermanent(withdrawId)
                             .chain(success -> evictCaches(withdraw.getCardNumber(), withdraw.getWithdrawId())
                                     .map(v -> ApiResponse.success("Withdraw permanently deleted!", success)));
-                })
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to permanently delete withdraw id={}", withdrawId, e);
-                    return new ApiResponse<>("error", "Failed to permanently delete withdraw: " + e.getMessage(), false);
                 });
     }
 
@@ -340,10 +334,11 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
         logger.info("🔄 Restoring ALL trashed withdraws");
 
         return withdrawCommandRepository.restoreAllDeleted()
-                .map(success -> ApiResponse.success("All withdraws restored successfully!", success))
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to restore all withdraws", e);
-                    return new ApiResponse<>("error", "Failed to restore all withdraws: " + e.getMessage(), false);
+                .chain(success -> {
+                    if (!success) {
+                        throw new ResourceNotFoundException("No trashed withdraws found");
+                    }
+                    return Uni.createFrom().item(ApiResponse.success("All withdraws restored successfully!", true));
                 });
     }
 
@@ -353,10 +348,11 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
         logger.info("💣 Permanently deleting ALL trashed withdraws");
 
         return withdrawCommandRepository.deleteAllDeleted()
-                .map(success -> ApiResponse.success("All withdraws permanently deleted!", success))
-                .onFailure().recoverWithItem(e -> {
-                    logger.error("💥 Failed to delete all withdraws", e);
-                    return new ApiResponse<>("error", "Failed to delete all withdraws: " + e.getMessage(), false);
+                .chain(success -> {
+                    if (!success) {
+                        throw new ResourceNotFoundException("No trashed withdraws found");
+                    }
+                    return Uni.createFrom().item(ApiResponse.success("All withdraws permanently deleted!", true));
                 });
     }
 }

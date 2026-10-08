@@ -3,7 +3,7 @@ package com.sanedge.card.entity;
 import java.math.BigDecimal;
 import java.sql.Date;
 
-import com.sanedge.card.entity.BaseModel;
+import com.sanedge.common.entity.BaseModel;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;

@@ -36,9 +36,9 @@ public class CardResponseDeleteAt {
                 .expireDate(card.getExpireDate() != null ? card.getExpireDate().toString() : null)
                 .cvv(card.getCvv())
                 .cardProvider(card.getCardProvider())
-                .createdAt(card.getCreatedAt() != null ? card.getCreatedAt().toString() : null)
-                .updatedAt(card.getUpdatedAt() != null ? card.getUpdatedAt().toString() : null)
-                .deletedAt(card.getDeletedAt() != null ? card.getDeletedAt().toString() : null)
+                .createdAt(card.getCreatedAt() != null ? card.getCreatedAt().toInstant().toString() : null)
+                .updatedAt(card.getUpdatedAt() != null ? card.getUpdatedAt().toInstant().toString() : null)
+                .deletedAt(card.getDeletedAt() != null ? card.getDeletedAt().toInstant().toString() : null)
                 .build();
     }
 }

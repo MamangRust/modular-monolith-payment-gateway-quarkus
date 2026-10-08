@@ -96,8 +96,11 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
                                                                                                 .item(ApiResponse.success("Merchant created successfully", MerchantResponse.from(merchant)));
                                                                         });
                                                 });
-                        }).onFailure().invoke(e -> {
+                        }).onFailure().recoverWithItem(e -> {
                                 logger.error("💥 Failed to create merchant | Name: {}, UserId: {}", req.getName(), req.getUserId(), e);
+                                return new ApiResponse<>("error",
+                                                "Failed to create merchant: " + e.getMessage(),
+                                                (MerchantResponse) null);
                         });
     }
 
@@ -155,8 +158,11 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
                                                                                 });
                                                         });
                                                 });
-                        }).onFailure().invoke(e -> {
+                        }).onFailure().recoverWithItem(e -> {
                                 logger.error("💥 Failed to update merchant | Id: {}", req.getMerchantId(), e);
+                                return new ApiResponse<>("error",
+                                                "Failed to update merchant: " + e.getMessage(),
+                                                (MerchantResponse) null);
                         });
     }
 
@@ -194,8 +200,11 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
                                                                                                 MerchantResponseDeleteAt.from(merchant));
                                                                         });
                                                 });
-                        }).onFailure().invoke(e -> {
+                        }).onFailure().recoverWithItem(e -> {
                                 logger.error("💥 Failed to trash merchant id={}", id, e);
+                                return new ApiResponse<>("error",
+                                                "Failed to trash merchant: " + e.getMessage(),
+                                                (MerchantResponseDeleteAt) null);
                         });
     }
 
@@ -233,8 +242,11 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
                                                                                                 MerchantResponseDeleteAt.from(merchant));
                                                                         });
                                                 });
-                        }).onFailure().invoke(e -> {
+                        }).onFailure().recoverWithItem(e -> {
                                 logger.error("💥 Failed to restore merchant id={}", id, e);
+                                return new ApiResponse<>("error",
+                                                "Failed to restore merchant: " + e.getMessage(),
+                                                (MerchantResponseDeleteAt) null);
                         });
     }
 
@@ -274,8 +286,11 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
                                                                                                 });
                                                                         });
                                                 });
-                        }).onFailure().invoke(e -> {
+                        }).onFailure().recoverWithItem(e -> {
                                 logger.error("💥 Failed to permanently delete merchant id={}", id, e);
+                                return new ApiResponse<>("error",
+                                                "Failed to delete merchant: " + e.getMessage(),
+                                                false);
                         });
     }
 
@@ -293,6 +308,9 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
 
                                 return merchantCommandRepository.restoreAllDeleted()
                                                 .map(restored -> {
+                                                        if (!restored) {
+                                                                throw new ResourceNotFoundException("No trashed merchants");
+                                                        }
                                                         logger.info("✅ Restored all trashed merchants");
                                                         return ApiResponse.success("Restored all trashed merchants", restored);
                                                 });
@@ -315,6 +333,9 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
 
                                 return merchantCommandRepository.deleteAllDeleted()
                                                 .map(deleted -> {
+                                                        if (!deleted) {
+                                                                throw new ResourceNotFoundException("No trashed merchants");
+                                                        }
                                                         logger.info("✅ Deleted all trashed merchants");
                                                         return ApiResponse.success("Deleted all trashed merchants", deleted);
                                                 });

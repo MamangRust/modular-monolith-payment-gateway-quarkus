@@ -100,10 +100,18 @@ public class WithdrawCommandRepository implements PanacheRepository<Withdraw> {
                     if (w != null) {
                         int attempts = w.compensationAttempts != null ? w.compensationAttempts : 0;
                         if (attempts >= maxAttempts) return Uni.createFrom().item(false);
+                        // Only bump the attempt counter when reclaiming an already-claimed
+                        // record (i.e. its previous lease expired). The first claim merely
+                        // establishes the lease and keeps the counter set by markCompensationRequired.
+                        boolean reclaim = w.compensationWorkerId != null;
                         w.compensationWorkerId = workerId;
                         w.compensationClaimToken = claimToken;
                         w.compensationLeaseUntil = leaseUntil;
-                        w.compensationAttempts = attempts + 1;
+                        if (reclaim) {
+                            w.compensationAttempts = attempts + 1;
+                        } else if (attempts < 1) {
+                            w.compensationAttempts = 1;
+                        }
                         w.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
                         return persist(w).map(v -> true);
                     }
@@ -119,7 +127,7 @@ public class WithdrawCommandRepository implements PanacheRepository<Withdraw> {
                         w.compensationWorkerId = null;
                         w.compensationClaimToken = null;
                         w.compensationLeaseUntil = null;
-                        w.status = com.sanedge.common.enums.Status.SUCCESS;
+                        w.status = com.sanedge.common.enums.Status.COMPENSATED;
                         w.setUpdatedAt(java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()));
                         return persist(w).map(v -> true);
                     }

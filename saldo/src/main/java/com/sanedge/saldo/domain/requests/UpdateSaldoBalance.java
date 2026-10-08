@@ -14,4 +14,13 @@ public class UpdateSaldoBalance {
 
     @Min(value = 50000, message = "Minimal saldo 50.000")
     private Long totalBalance;
+
+    /** When set, the balance is mutated atomically by this delta instead of being overwritten. */
+    private Long deltaBalance;
+
+    /** Floor the resulting balance must not drop below; only used with {@link #deltaBalance}. */
+    private Long minimumBalance;
+
+    /** Idempotency key for the atomic delta mutation; only used with {@link #deltaBalance}. */
+    private String operationKey;
 }

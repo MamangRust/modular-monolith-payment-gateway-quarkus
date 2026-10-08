@@ -37,10 +37,10 @@ import jakarta.validation.Valid;
 public class UserCommandServiceImpl implements UserCommandService {
         private static final Logger logger = LoggerFactory.getLogger(UserCommandServiceImpl.class);
 
-        UserRepository userRepository;
-        PasswordUtil passwordUtil;
-        RedisService redisService;
-        TracingMetrics tracingMetrics;
+        private final UserRepository userRepository;
+        private final PasswordUtil passwordUtil;
+        private final RedisService redisService;
+        private final TracingMetrics tracingMetrics;
 
         @Inject
         @GrpcClient("role")
@@ -49,7 +49,8 @@ public class UserCommandServiceImpl implements UserCommandService {
         @Inject
         public UserCommandServiceImpl(UserRepository userRepository,
                         PasswordUtil passwordUtil,
-                        RedisService redisService, TracingMetrics tracingMetrics) {
+                        RedisService redisService,
+                        TracingMetrics tracingMetrics) {
                 this.userRepository = userRepository;
                 this.passwordUtil = passwordUtil;
                 this.redisService = redisService;
@@ -59,28 +60,37 @@ public class UserCommandServiceImpl implements UserCommandService {
         @Override
         @WithTransaction
         public Uni<ApiResponse<UserResponse>> createUser(RegisterRequest request) {
-                logger.info("Creating new user with username: {}", request.getUsername());
-
-                if (!request.getPassword().equals(request.getConfirmPassword())) {
-                        logger.warn("User creation failed - passwords do not match for username: {}",
-                                        request.getUsername());
-                        throw new InvalidRequestException("Passwords do not match");
+                // Derive a username from the email when none is provided (register
+                // requests via the auth service don't carry a username field).
+                String username = request.getUsername() == null || request.getUsername().isBlank()
+                                ? request.getEmail().split("@")[0]
+                                : request.getUsername();
+                if (username.length() > 20) {
+                        // Keep the unique tail (e.g. timestamp suffix) so derived usernames
+                        // don't collide after truncation: first 12 + last 7 chars.
+                        username = username.substring(0, 12) + username.substring(username.length() - 7);
                 }
+                final String resolvedUsername = username;
 
+                logger.info("Creating new user with username: {}", resolvedUsername);
                 Attributes attrs = Attributes.builder()
-                                .put("operation", "create_user")
-                                .put("service.name", "user-service")
-                                .put("user.username", request.getUsername())
+                                .put("user.username", resolvedUsername)
+                                .put("user.email", request.getEmail())
                                 .build();
 
-                return tracingMetrics.<ApiResponse<UserResponse>>traceAndMeasure(
-                                "createUser", "create_user", attrs, () -> {
+                return runTraced("createUser", "create_user", attrs,
+                                () -> {
+                                        if (!request.getPassword().equals(request.getConfirmPassword())) {
+                                                logger.warn("User creation failed - passwords do not match for username: {}",
+                                                                resolvedUsername);
+                                                throw new InvalidRequestException("Passwords do not match");
+                                        }
 
-                                        return userRepository.existsByUsername(request.getUsername())
+                                        return userRepository.existsByUsername(resolvedUsername)
                                                         .chain(usernameExists -> {
                                                                 if (usernameExists) {
                                                                         logger.warn("User creation failed - username already exists: {}",
-                                                                                        request.getUsername());
+                                                                                        resolvedUsername);
                                                                         throw new ResourceAlreadyExistsException(
                                                                                         "Username already exists");
                                                                 }
@@ -95,21 +105,26 @@ public class UserCommandServiceImpl implements UserCommandService {
                                                                 }
 
                                                                 User user = new User();
-                                                                user.setUsername(request.getUsername());
+                                                                user.setUsername(resolvedUsername);
                                                                 user.setEmail(request.getEmail());
                                                                 user.setFirstname(request.getFirstname());
                                                                 user.setLastname(request.getLastname());
-                                                                user.setPassword(passwordUtil.hashPassword(request.getPassword()));
+                                                                user.setPassword(passwordUtil
+                                                                                .hashPassword(request.getPassword()));
 
                                                                 Uni<Set<Role>> rolesUni;
-                                                                if (request.getRoleNames() != null && !request.getRoleNames().isEmpty()) {
-                                                                        List<Uni<Role>> roleUnis = request.getRoleNames().stream()
+                                                                if (request.getRoleNames() != null
+                                                                                && !request.getRoleNames().isEmpty()) {
+                                                                        List<Uni<Role>> roleUnis = request
+                                                                                        .getRoleNames().stream()
                                                                                         .map(this::resolveRoleViaGrpc)
                                                                                         .collect(Collectors.toList());
-                                                                        rolesUni = Uni.join().all(roleUnis).andFailFast()
+                                                                        rolesUni = Uni.join().all(roleUnis)
+                                                                                        .andFailFast()
                                                                                         .map(roles -> roles.stream()
                                                                                                         .filter(java.util.Objects::nonNull)
-                                                                                                        .collect(Collectors.toSet()));
+                                                                                                        .collect(Collectors
+                                                                                                                        .toSet()));
                                                                 } else {
                                                                         rolesUni = Uni.createFrom().item(Set.of());
                                                                 }
@@ -132,20 +147,15 @@ public class UserCommandServiceImpl implements UserCommandService {
                                                                                         .map(v -> {
                                                                                                 UserResponse userResponse = UserResponse
                                                                                                                 .from(user);
-
                                                                                                 logger.info("Successfully created user with id: {} and username: {}",
                                                                                                                 user.id,
                                                                                                                 user.getUsername());
-                                                                                                logger.info("User created. List caches will be refreshed upon expiry.");
-
-                                                                                                return ApiResponse.success(
-                                                                                                                "User registered successfully",
-                                                                                                                userResponse);
+                                                                                                return ApiResponse
+                                                                                                                .success("User registered successfully",
+                                                                                                                                userResponse);
                                                                                         });
                                                                 });
                                                         });
-                                }).onFailure().invoke(e -> {
-                                        logger.error("Error creating user with username: {}", request.getUsername(), e);
                                 });
         }
 
@@ -153,254 +163,269 @@ public class UserCommandServiceImpl implements UserCommandService {
         @WithTransaction
         public Uni<ApiResponse<UserResponse>> updateUser(@Valid UpdateUserRequest request) {
                 logger.info("Updating user with id: {}", request.getId());
-
                 Attributes attrs = Attributes.builder()
-                                .put("operation", "update_user")
-                                .put("service.name", "user-service")
-                                .put("user.id", String.valueOf(request.getId()))
+                                .put("user.id", request.getId().toString())
                                 .build();
 
-                return tracingMetrics.<ApiResponse<UserResponse>>traceAndMeasure(
-                                "updateUser", "update_user", attrs, () -> {
+                return runTraced("updateUser", "update_user", attrs,
+                                () -> userRepository.findById(request.getId())
+                                                .chain(existingUser -> {
+                                                        if (existingUser == null) {
+                                                                logger.warn("User update failed - user not found with id: {}",
+                                                                                request.getId());
+                                                                throw new ResourceNotFoundException(
+                                                                                "User not found with id: "
+                                                                                                + request.getId());
+                                                        }
 
-                                        return userRepository.findById(request.getId())
-                                                        .chain(existingUser -> {
-                                                                if (existingUser == null) {
-                                                                        logger.warn("User update failed - user not found with id: {}",
-                                                                                        request.getId());
-                                                                        throw new ResourceNotFoundException(
-                                                                                        "User not found with id: " + request.getId());
-                                                                }
+                                                        Uni<Void> checkUsernameFlow;
+                                                        if (request.getUsername() != null
+                                                                        && !request.getUsername().equals(
+                                                                                        existingUser.getUsername())) {
+                                                                checkUsernameFlow = userRepository
+                                                                                .existsByUsername(request.getUsername())
+                                                                                .map(exists -> {
+                                                                                        if (exists) {
+                                                                                                logger.warn("User update failed - username '{}' already in use",
+                                                                                                                request.getUsername());
+                                                                                                throw new ResourceAlreadyExistsException(
+                                                                                                                "Username '" + request
+                                                                                                                                .getUsername()
+                                                                                                                                + "' is already in use");
+                                                                                        }
+                                                                                        existingUser.setUsername(request
+                                                                                                        .getUsername());
+                                                                                        return null;
+                                                                                });
+                                                        } else {
+                                                                checkUsernameFlow = Uni.createFrom().nullItem();
+                                                        }
 
-                                                                Uni<Void> checkUsernameFlow;
-                                                                if (request.getUsername() != null
-                                                                                && !request.getUsername().equals(existingUser.getUsername())) {
-                                                                        checkUsernameFlow = userRepository
-                                                                                        .existsByUsername(request.getUsername())
+                                                        return checkUsernameFlow.chain(v -> {
+                                                                Uni<Void> checkEmailFlow;
+                                                                if (request.getEmail() != null && !request.getEmail()
+                                                                                .equals(existingUser.getEmail())) {
+                                                                        checkEmailFlow = userRepository
+                                                                                        .existsByEmail(request
+                                                                                                        .getEmail())
                                                                                         .map(exists -> {
                                                                                                 if (exists) {
-                                                                                                        logger.warn("User update failed - username '{}' already in use",
-                                                                                                                        request.getUsername());
+                                                                                                        logger.warn("User update failed - email '{}' already in use",
+                                                                                                                        request.getEmail());
                                                                                                         throw new ResourceAlreadyExistsException(
-                                                                                                                        "Username '" + request
-                                                                                                                                        .getUsername()
-                                                                                                                                        + "' is already in use");
+                                                                                                                        "Email '" + request
+                                                                                                                                                                                                        .getEmail()
+                                                                                                                                                                                                        + "' is already in use");
                                                                                                 }
-                                                                                                existingUser.setUsername(request.getUsername());
+                                                                                                existingUser.setEmail(
+                                                                                                                request.getEmail());
                                                                                                 return null;
                                                                                         });
                                                                 } else {
-                                                                        checkUsernameFlow = Uni.createFrom().nullItem();
+                                                                        checkEmailFlow = Uni.createFrom().nullItem();
                                                                 }
 
-                                                                return checkUsernameFlow.chain(v -> {
-                                                                        Uni<Void> checkEmailFlow;
-                                                                        if (request.getEmail() != null && !request.getEmail()
-                                                                                        .equals(existingUser.getEmail())) {
-                                                                                checkEmailFlow = userRepository
-                                                                                                .existsByEmail(request.getEmail())
-                                                                                                .map(exists -> {
-                                                                                                        if (exists) {
-                                                                                                                logger.warn("User update failed - email '{}' already in use",
-                                                                                                                                request.getEmail());
-                                                                                                                throw new ResourceAlreadyExistsException(
-                                                                                                                                "Email '" + request
-                                                                                                                                                .getEmail()
-                                                                                                                                                + "' is already in use");
-                                                                                                        }
-                                                                                                        existingUser.setEmail(request.getEmail());
-                                                                                                        return null;
-                                                                                                });
-                                                                        } else {
-                                                                                checkEmailFlow = Uni.createFrom().nullItem();
+                                                                return checkEmailFlow;
+                                                        }).chain(v -> {
+                                                                if (request.getPassword() != null) {
+                                                                        if (!request.getPassword().equals(
+                                                                                        request.getConfirmPassword())) {
+                                                                                logger.warn("User update failed - passwords do not match for user id: {}",
+                                                                                                request.getId());
+                                                                                throw new InvalidRequestException(
+                                                                                                "Passwords do not match");
                                                                         }
+                                                                        existingUser.setPassword(passwordUtil
+                                                                                        .hashPassword(request
+                                                                                                        .getPassword()));
+                                                                }
 
-                                                                        return checkEmailFlow;
-                                                                }).chain(v -> {
-                                                                        if (request.getPassword() != null) {
-                                                                                if (!request.getPassword()
-                                                                                                .equals(request.getConfirmPassword())) {
-                                                                                        logger.warn("User update failed - passwords do not match for user id: {}",
-                                                                                                        request.getId());
-                                                                                        throw new InvalidRequestException(
-                                                                                                        "Passwords do not match");
-                                                                                }
-                                                                                existingUser.setPassword(passwordUtil
-                                                                                                .hashPassword(request.getPassword()));
-                                                                        }
+                                                                if (request.getFirstname() != null) {
+                                                                        existingUser.setFirstname(
+                                                                                        request.getFirstname());
+                                                                }
+                                                                if (request.getLastname() != null) {
+                                                                        existingUser.setLastname(request.getLastname());
+                                                                }
 
-                                                                        if (request.getFirstname() != null) {
-                                                                                existingUser.setFirstname(request.getFirstname());
-                                                                        }
-                                                                        if (request.getLastname() != null) {
-                                                                                existingUser.setLastname(request.getLastname());
-                                                                        }
+                                                                Uni<Void> rolesFlow;
+                                                                if (request.getRoleNames() != null) {
+                                                                        List<Uni<Role>> roleUnis = request
+                                                                                        .getRoleNames().stream()
+                                                                                        .map(this::resolveRoleViaGrpc)
+                                                                                        .collect(Collectors.toList());
+                                                                        rolesFlow = Uni.join().all(roleUnis)
+                                                                                        .andFailFast()
+                                                                                        .map(roles -> {
+                                                                                                existingUser.getRoles()
+                                                                                                                .clear();
+                                                                                                existingUser.getRoles()
+                                                                                                                .addAll(roles);
+                                                                                                return null;
+                                                                                        });
+                                                                } else {
+                                                                        rolesFlow = Uni.createFrom().nullItem();
+                                                                }
 
-                                                                        Uni<Void> rolesFlow;
-                                                                        if (request.getRoleNames() != null) {
-                                                                                List<Uni<Role>> roleUnis = request.getRoleNames().stream()
-                                                                                                .map(this::resolveRoleViaGrpc)
-                                                                                                .collect(Collectors.toList());
-                                                                                rolesFlow = Uni.join().all(roleUnis).andFailFast()
-                                                                                                .map(roles -> {
-                                                                                                        existingUser.getRoles().clear();
-                                                                                                        existingUser.getRoles().addAll(roles);
-                                                                                                        return null;
-                                                                                                });
-                                                                        } else {
-                                                                                rolesFlow = Uni.createFrom().nullItem();
-                                                                        }
+                                                                return rolesFlow.chain(v3 -> {
+                                                                        existingUser.setUpdatedAt(Timestamp
+                                                                                        .valueOf(LocalDateTime.now()));
+                                                                        return userRepository.persist(existingUser)
+                                                                                        .chain(v4 -> {
+                                                                                                UserResponse userResponse = UserResponse
+                                                                                                                .from(existingUser);
+                                                                                                String cacheKey = "user:"
+                                                                                                                + request.getId();
 
-                                                                        return rolesFlow.chain(v3 -> {
-                                                                                existingUser.setUpdatedAt(
-                                                                                                Timestamp.valueOf(LocalDateTime.now()));
-                                                                                return userRepository.persist(existingUser)
-                                                                                                .chain(v4 -> {
-                                                                                                        UserResponse userResponse = UserResponse
-                                                                                                                        .from(existingUser);
-                                                                                                        String cacheKey = "user:"
-                                                                                                                        + request.getId();
-
-                                                                                                        return redisService.deleteReactive(
-                                                                                                                        cacheKey)
-                                                                                                                        .map(v5 -> {
-                                                                                                                                logger.info("Invalidated cache for key: {}",
-                                                                                                                                                cacheKey);
-                                                                                                                                logger.info("Successfully updated user with id: {}",
-                                                                                                                                                request.getId());
-                                                                                                                                return ApiResponse.success(
-                                                                                                                                                "User updated successfully",
+                                                                                                return redisService
+                                                                                                                .deleteReactive(cacheKey)
+                                                                                                                .map(v5 -> {
+                                                                                                                        logger.info("Invalidated cache for key: {}",
+                                                                                                                                cacheKey);
+                                                                                                                        logger.info("Successfully updated user with id: {}",
+                                                                                                                                request.getId());
+                                                                                                                        return ApiResponse
+                                                                                                                                .success("User updated successfully",
                                                                                                                                                 userResponse);
-                                                                                                                        });
-                                                                                                });
-                                                                        });
+                                                                                                                });
+                                                                                        });
                                                                 });
                                                         });
-                                }).onFailure().invoke(e -> {
-                                        logger.error("Error updating user with id: {}", request.getId(), e);
-                                });
+                                                })
+                                                .onFailure().recoverWithItem(e -> {
+                                                        logger.error("Failed to update user with id: {}",
+                                                                        request.getId(), e);
+                                                        return new ApiResponse<>("error",
+                                                                        "Failed to update user: " + e.getMessage(),
+                                                                        (UserResponse) null);
+                                                }));
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<UserResponseDeleteAt>> trashed(Long id) {
                 logger.info("Trashing user with id: {}", id);
-
                 Attributes attrs = Attributes.builder()
-                                .put("operation", "trash_user")
-                                .put("service.name", "user-service")
-                                .put("user.id", String.valueOf(id))
+                                .put("user.id", id.toString())
                                 .build();
 
-                return tracingMetrics.<ApiResponse<UserResponseDeleteAt>>traceAndMeasure(
-                                "trashUser", "trash_user", attrs, () -> {
+                return runTraced("trashUser", "trash_user", attrs,
+                                () -> userRepository.trash(id)
+                                                .chain(trashedUser -> {
+                                                        if (trashedUser == null) {
+                                                                logger.warn("User trash failed - user not found with id: {}",
+                                                                                id);
+                                                                throw new ResourceNotFoundException(
+                                                                                "Trashed user not found with id: "
+                                                                                                + id);
+                                                        }
 
-                                        return userRepository.trash(id)
-                                                        .chain(trashedUser -> {
-                                                                if (trashedUser == null) {
-                                                                        logger.warn("User trash failed - user not found with id: {}", id);
-                                                                        throw new ResourceNotFoundException(
-                                                                                        "Trashed user not found with id: " + id);
-                                                                }
+                                                        UserResponseDeleteAt userResponseDeleteAt = UserResponseDeleteAt
+                                                                        .from(trashedUser);
+                                                        String cacheKey = "user:" + id;
 
-                                                                UserResponseDeleteAt userResponseDeleteAt = UserResponseDeleteAt
-                                                                                .from(trashedUser);
-                                                                String cacheKey = "user:" + id;
-
-                                                                return redisService.deleteReactive(cacheKey)
-                                                                                .map(v -> {
-                                                                                        logger.info("Invalidated cache for key: {}", cacheKey);
-                                                                                        logger.info("Successfully trashed user with id: {}",
-                                                                                                        id);
-                                                                                        return ApiResponse.success("User trashed successfully",
-                                                                                                        userResponseDeleteAt);
-                                                                                });
-                                                        });
-                                }).onFailure().invoke(e -> {
-                                        logger.error("Error trashing user with id: {}", id, e);
-                                });
+                                                        return redisService.deleteReactive(cacheKey)
+                                                                        .map(v -> {
+                                                                                logger.info("Invalidated cache for key: {}",
+                                                                                                cacheKey);
+                                                                                logger.info("Successfully trashed user with id: {}",
+                                                                                                id);
+                                                                                return ApiResponse.success(
+                                                                                                "User trashed successfully",
+                                                                                                userResponseDeleteAt);
+                                                                        });
+                                                })
+                                                .onFailure().recoverWithItem(e -> {
+                                                        logger.error("Failed to trash user with id: {}", id, e);
+                                                        return new ApiResponse<>("error",
+                                                                        "Failed to trash user: " + e.getMessage(),
+                                                                        (UserResponseDeleteAt) null);
+                                                }));
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<UserResponseDeleteAt>> restore(Long id) {
                 logger.info("Restoring user with id: {}", id);
-
                 Attributes attrs = Attributes.builder()
-                                .put("operation", "restore_user")
-                                .put("service.name", "user-service")
-                                .put("user.id", String.valueOf(id))
+                                .put("user.id", id.toString())
                                 .build();
 
-                return tracingMetrics.<ApiResponse<UserResponseDeleteAt>>traceAndMeasure(
-                                "restoreUser", "restore_user", attrs, () -> {
+                return runTraced("restoreUser", "restore_user", attrs,
+                                () -> userRepository.restore(id)
+                                                .chain(restoredUser -> {
+                                                        if (restoredUser == null) {
+                                                                logger.warn("User restore failed - user not found with id: {}",
+                                                                                id);
+                                                                throw new ResourceNotFoundException(
+                                                                                "Restore user not found with id: "
+                                                                                                + id);
+                                                        }
 
-                                        return userRepository.restore(id)
-                                                        .chain(restoredUser -> {
-                                                                if (restoredUser == null) {
-                                                                        logger.warn("User restore failed - user not found with id: {}", id);
-                                                                        throw new ResourceNotFoundException(
-                                                                                        "Restore user not found with id: " + id);
-                                                                }
+                                                        UserResponseDeleteAt userResponseDeleteAt = UserResponseDeleteAt
+                                                                        .from(restoredUser);
+                                                        String cacheKey = "user:" + id;
 
-                                                                UserResponseDeleteAt userResponseDeleteAt = UserResponseDeleteAt
-                                                                                .from(restoredUser);
-                                                                String cacheKey = "user:" + id;
-
-                                                                return redisService.deleteReactive(cacheKey)
-                                                                                .map(v -> {
-                                                                                        logger.info("Invalidated cache for key: {}", cacheKey);
-                                                                                        logger.info("Successfully restored user with id: {}",
-                                                                                                        id);
-                                                                                        return ApiResponse.success("User restored successfully",
-                                                                                                        userResponseDeleteAt);
-                                                                                });
-                                                        });
-                                }).onFailure().invoke(e -> {
-                                        logger.error("Error restoring user with id: {}", id, e);
-                                });
+                                                        return redisService.deleteReactive(cacheKey)
+                                                                        .map(v -> {
+                                                                                logger.info("Invalidated cache for key: {}",
+                                                                                                cacheKey);
+                                                                                logger.info("Successfully restored user with id: {}",
+                                                                                                id);
+                                                                                return ApiResponse.success(
+                                                                                                "User restored successfully",
+                                                                                                userResponseDeleteAt);
+                                                                        });
+                                                })
+                                                .onFailure().recoverWithItem(e -> {
+                                                        logger.error("Failed to restore user with id: {}", id, e);
+                                                        return new ApiResponse<>("error",
+                                                                        "Failed to restore user: " + e.getMessage(),
+                                                                        (UserResponseDeleteAt) null);
+                                                }));
         }
 
         @Override
         @WithTransaction
         public Uni<ApiResponse<Void>> deletePermanent(Long id) {
                 logger.info("Permanently deleting user with id: {}", id);
-
                 Attributes attrs = Attributes.builder()
-                                .put("operation", "delete_user_permanent")
-                                .put("service.name", "user-service")
-                                .put("user.id", String.valueOf(id))
+                                .put("user.id", id.toString())
                                 .build();
 
-                return tracingMetrics.<ApiResponse<Void>>traceAndMeasure(
-                                "deleteUserPermanent", "delete_user_permanent", attrs, () -> {
+                return runTraced("deleteUserPermanent", "delete_user_permanent", attrs,
+                                () -> userRepository.findById(id)
+                                                .chain(userToDelete -> {
+                                                        if (userToDelete == null) {
+                                                                logger.warn("Permanent delete failed - user not found with id: {}",
+                                                                                id);
+                                                                throw new ResourceNotFoundException(
+                                                                                "User not found with id: " + id);
+                                                        }
 
-                                        return userRepository.findById(id)
-                                                        .chain(userToDelete -> {
-                                                                if (userToDelete == null) {
-                                                                        logger.warn("Permanent delete failed - user not found with id: {}",
-                                                                                        id);
-                                                                        throw new ResourceNotFoundException(
-                                                                                        "User not found with id: " + id);
-                                                                }
-
-                                                                return userRepository.deletePermanent(id)
-                                                                                .chain(v -> {
-                                                                                        String cacheKey = "user:" + id;
-                                                                                        return redisService.deleteReactive(cacheKey)
-                                                                                                        .map(v2 -> {
-                                                                                                                logger.info("Invalidated cache for key: {}",
-                                                                                                                                cacheKey);
-                                                                                                                logger.info("Successfully permanently deleted user with id: {}",
-                                                                                                                                id);
-                                                                                                                return ApiResponse.success(
-                                                                                                                                "User deleted permanently");
-                                                                                                        });
-                                                                                });
-                                                        });
-                                }).onFailure().invoke(e -> {
-                                        logger.error("Error permanently deleting user with id: {}", id, e);
-                                });
+                                                        return userRepository.deletePermanent(id)
+                                                                        .chain(v -> {
+                                                                                String cacheKey = "user:" + id;
+                                                                                return redisService.deleteReactive(
+                                                                                                cacheKey)
+                                                                                                .map(v2 -> {
+                                                                                                        logger.info("Invalidated cache for key: {}",
+                                                                                                                        cacheKey);
+                                                                                                        logger.info("Successfully permanently deleted user with id: {}",
+                                                                                                                        id);
+                                                                                                        return ApiResponse
+                                                                                                                        .success("User deleted permanently");
+                                                                                                });
+                                                                                        });
+                                                })
+                                                .onFailure().recoverWithItem(e -> {
+                                                        logger.error("Failed to permanently delete user with id: {}",
+                                                                        id, e);
+                                                        return new ApiResponse<>("error",
+                                                                        "Failed to delete user permanently: "
+                                                                                        + e.getMessage(),
+                                                                        null);
+                                                }));
         }
 
         @Override
@@ -408,23 +433,18 @@ public class UserCommandServiceImpl implements UserCommandService {
         public Uni<ApiResponse<Void>> restoreAllTrashedUsers() {
                 logger.info("Restoring all trashed users");
 
-                Attributes attrs = Attributes.builder()
-                                .put("operation", "restore_all_trashed_users")
-                                .put("service.name", "user-service")
-                                .build();
+                return runTraced("restoreAllTrashedUsers", "restore_all_trashed_users", Attributes.empty(),
+                                () -> userRepository.restoreAllDeleted()
+                                                .map(v -> {
+                                                        if (!v) {
+                                                                throw new ResourceNotFoundException(
+                                                                                "No users found in trash");
+                                                        }
 
-                return tracingMetrics.<ApiResponse<Void>>traceAndMeasure(
-                                "restoreAllTrashedUsers", "restore_all_trashed_users", attrs, () -> {
-
-                                        return userRepository.restoreAllDeleted()
-                                                        .map(v -> {
-                                                                logger.warn("All trashed users restored. Caches will be refreshed upon expiry or next access.");
-                                                                logger.info("Successfully restored all trashed users");
-                                                                return ApiResponse.success("All trashed users have been restored successfully");
-                                                        });
-                                }).onFailure().invoke(e -> {
-                                        logger.error("Error restoring all trashed users", e);
-                                });
+                                                        logger.info("Successfully restored all trashed users");
+                                                        return ApiResponse.success(
+                                                                        "All trashed users have been restored successfully");
+                                                }));
         }
 
         @Override
@@ -432,23 +452,18 @@ public class UserCommandServiceImpl implements UserCommandService {
         public Uni<ApiResponse<Void>> deleteAllTrashedUsers() {
                 logger.info("Permanently deleting all trashed users");
 
-                Attributes attrs = Attributes.builder()
-                                .put("operation", "delete_all_trashed_users")
-                                .put("service.name", "user-service")
-                                .build();
+                return runTraced("deleteAllTrashedUsers", "delete_all_trashed_users", Attributes.empty(),
+                                () -> userRepository.deleteAllDeleted()
+                                                .map(v -> {
+                                                        if (!v) {
+                                                                throw new ResourceNotFoundException(
+                                                                                "No users found in trash");
+                                                        }
 
-                return tracingMetrics.<ApiResponse<Void>>traceAndMeasure(
-                                "deleteAllTrashedUsers", "delete_all_trashed_users", attrs, () -> {
-
-                                        return userRepository.deleteAllDeleted()
-                                                        .map(v -> {
-                                                                logger.warn("All trashed users deleted. Caches will be refreshed upon expiry or next access.");
-                                                                logger.info("Successfully deleted all trashed users");
-                                                                return ApiResponse.success("All trashed users have been deleted permanently");
-                                                        });
-                                }).onFailure().invoke(e -> {
-                                        logger.error("Error deleting all trashed users", e);
-                                });
+                                                        logger.info("Successfully deleted all trashed users");
+                                                        return ApiResponse.success(
+                                                                        "All trashed users have been deleted permanently");
+                                                }));
         }
 
         @Override
@@ -494,23 +509,24 @@ public class UserCommandServiceImpl implements UserCommandService {
         }
 
         private Uni<Role> resolveRoleViaGrpc(String roleName) {
-                return roleQueryService.findAllRole(pb.role.Role.FindAllRoleRequest.newBuilder()
-                                .setPage(1)
-                                .setPageSize(100)
-                                .setSearch(roleName)
+                return roleQueryService.findByNameRole(pb.role.RoleQuery.FindByNameRoleRequest.newBuilder()
+                                .setName(roleName)
                                 .build())
                                 .chain(response -> {
-                                        pb.role.Role.RoleResponse matchedRole = response.getDataList().stream()
-                                                        .filter(r -> r.getName().equalsIgnoreCase(roleName))
-                                                        .findFirst()
-                                                        .orElse(null);
-                                        if (matchedRole == null) {
-                                                return Uni.createFrom().failure(new ResourceNotFoundException("Role '" + roleName + "' not found in Role service"));
+                                        if (!response.hasData()) {
+                                                return Uni.createFrom().failure(new ResourceNotFoundException(
+                                                                "Role '" + roleName + "' not found in Role service"));
                                         }
+                                        pb.role.Role.RoleResponse matchedRole = response.getData();
                                         Role role = new Role();
                                         role.id = (long) matchedRole.getId();
                                         role.setRoleName(matchedRole.getName());
                                         return Uni.createFrom().item(role);
                                 });
+        }
+
+        private <T> Uni<T> runTraced(String operationName, String method, Attributes attributes,
+                        java.util.function.Supplier<Uni<T>> supplier) {
+                return tracingMetrics.traceAndMeasure(operationName, method, attributes, supplier);
         }
 }

@@ -28,7 +28,6 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import com.sanedge.common.config.RedisService;
 import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.common.enums.Status;
-import com.sanedge.common.exception.InvalidRequestException;
 import com.sanedge.common.exception.ResourceNotFoundException;
 import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.topup.domain.requests.CreateTopupRequest;
@@ -288,9 +287,9 @@ class TopupCommandServiceImplTest {
                 @Test
                 void notFoundOrNotTrashed() {
                         when(topupCommandRepo.restore(1L)).thenReturn(Uni.createFrom().nullItem());
-                        assertThatThrownBy(() -> service.restore(1L).await().indefinitely())
-                                        .isInstanceOf(InvalidRequestException.class)
-                                        .hasMessageContaining("must be trashed first");
+                        ApiResponse<TopupResponseDeleteAt> resp = service.restore(1L).await().indefinitely();
+                        assertThat(resp.status()).isEqualTo("error");
+                        assertThat(resp.message()).contains("Topup not found");
                 }
         }
 
@@ -312,8 +311,9 @@ class TopupCommandServiceImplTest {
                 void notTrashed() {
                         when(topupQueryRepo.findTopupById(1L))
                                         .thenReturn(Uni.createFrom().item(createTopup(1L, 50000)));
-                        assertThatThrownBy(() -> service.deletePermanent(1L).await().indefinitely())
-                                        .isInstanceOf(InvalidRequestException.class);
+                        ApiResponse<Boolean> resp = service.deletePermanent(1L).await().indefinitely();
+                        assertThat(resp.status()).isEqualTo("error");
+                        assertThat(resp.message()).contains("must be trashed first");
                 }
         }
 

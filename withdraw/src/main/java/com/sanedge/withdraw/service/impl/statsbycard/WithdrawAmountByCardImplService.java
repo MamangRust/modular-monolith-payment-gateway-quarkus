@@ -1,5 +1,6 @@
 package com.sanedge.withdraw.service.impl.statsbycard;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -87,7 +88,7 @@ public class WithdrawAmountByCardImplService implements WithdrawAmountByCardServ
             validateCardNumber(cardNumber);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input: {}", e.getMessage());
-            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:statsbycard:monthly:amount:%s:%d", cardNumber, year);
@@ -122,12 +123,12 @@ public class WithdrawAmountByCardImplService implements WithdrawAmountByCardServ
                                                 .map(v -> ApiResponse.success(
                                                         "Monthly withdraw amounts by card retrieved successfully!",
                                                         response));
-                                    })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch monthly withdraw amounts by card", e);
-                                        return new ApiResponse<>("error", "Failed to fetch monthly withdraw amounts by card",
-                                                null);
                                     }));
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch monthly withdraw amounts by card", e);
+                    return new ApiResponse<>("error", "Failed to fetch monthly withdraw amounts by card",
+                            Collections.emptyList());
                 });
     }
 
@@ -143,7 +144,7 @@ public class WithdrawAmountByCardImplService implements WithdrawAmountByCardServ
             validateCardNumber(cardNumber);
         } catch (IllegalArgumentException e) {
             logger.warn("⚠️ Invalid input: {}", e.getMessage());
-            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", null));
+            return Uni.createFrom().item(new ApiResponse<>("error", "invalid input", Collections.emptyList()));
         }
 
         String cacheKey = String.format("withdraws:statsbycard:yearly:amount:%s:%d", cardNumber, year);
@@ -178,12 +179,12 @@ public class WithdrawAmountByCardImplService implements WithdrawAmountByCardServ
                                                 .map(v -> ApiResponse.success(
                                                         "Yearly withdraw amounts by card retrieved successfully!",
                                                         response));
-                                    })
-                                    .onFailure().recoverWithItem(e -> {
-                                        logger.error("❌ Failed to fetch yearly withdraw amounts by card", e);
-                                        return new ApiResponse<>("error", "Failed to fetch yearly withdraw amounts by card",
-                                                null);
                                     }));
+                })
+                .onFailure().recoverWithItem(e -> {
+                    logger.error("❌ Failed to fetch yearly withdraw amounts by card", e);
+                    return new ApiResponse<>("error", "Failed to fetch yearly withdraw amounts by card",
+                            Collections.emptyList());
                 });
     }
 }

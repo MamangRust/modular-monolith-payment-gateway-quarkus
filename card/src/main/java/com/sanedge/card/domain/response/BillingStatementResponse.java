@@ -46,8 +46,8 @@ public class BillingStatementResponse {
                 .interest(bs.interest)
                 .statementDate(bs.statementDate != null ? bs.statementDate.toString() : null)
                 .status(bs.status)
-                .createdAt(bs.getCreatedAt() != null ? bs.getCreatedAt().toString() : null)
-                .updatedAt(bs.getUpdatedAt() != null ? bs.getUpdatedAt().toString() : null)
+                .createdAt(bs.getCreatedAt() != null ? bs.getCreatedAt().toInstant().toString() : null)
+                .updatedAt(bs.getUpdatedAt() != null ? bs.getUpdatedAt().toInstant().toString() : null)
                 .build();
     }
 }

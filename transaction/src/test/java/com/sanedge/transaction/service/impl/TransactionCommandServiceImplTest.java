@@ -16,7 +16,6 @@ import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -35,6 +34,7 @@ import com.sanedge.transaction.service.KafkaService;
 
 import io.smallrye.mutiny.Uni;
 import io.vertx.core.json.JsonObject;
+import io.opentelemetry.api.OpenTelemetry;
 import jakarta.validation.Validator;
 import pb.card.Card;
 import pb.card.CardQueryService;
@@ -83,13 +83,27 @@ class TransactionCommandServiceImplTest {
     @Mock
     TracingMetrics tracingMetrics;
 
-    @InjectMocks
-    TransactionCommandServiceImpl transactionCommandService;
+    private TransactionCommandServiceImpl transactionCommandService;
 
     private Transaction transaction;
 
     @BeforeEach
     void setUp() {
+        // The service builds Tracer/Meter from OpenTelemetry in its constructor, so it
+        // cannot be created by @InjectMocks with a null/mock OpenTelemetry; construct it
+        // manually with the no-op instance.
+        transactionCommandService = new TransactionCommandServiceImpl(
+                transactionQueryRepository,
+                transactionCommandRepository,
+                merchantQueryService,
+                saldoQueryService,
+                saldoCommandService,
+                cardQueryService,
+                validator,
+                redisService,
+                kafkaService,
+                OpenTelemetry.noop());
+
         transaction = new Transaction();
         transaction.transactionId = 1L;
         transaction.transactionNo = UUID.randomUUID();
@@ -203,8 +217,7 @@ class TransactionCommandServiceImplTest {
         assertThat(result.status()).isEqualTo("success");
         assertThat(result.data()).isNotNull();
         assertThat(result.data().getCardNumber()).isEqualTo("4111111111111111");
-        // Two-phase ledger: PENDING reservation persist, then final persist with leg-B metadata
-        verify(transactionCommandRepository, times(2)).persist(any(com.sanedge.transaction.entity.Transaction.class));
+        verify(transactionCommandRepository, times(1)).persist(any(com.sanedge.transaction.entity.Transaction.class));
     }
 
     // ──────────────────────────────────────────────

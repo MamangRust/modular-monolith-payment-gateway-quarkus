@@ -2,6 +2,7 @@ package com.sanedge.card.repository;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 
@@ -28,8 +29,8 @@ class CardAuthTransactionRepositoryTest {
         txn.setCardNumber(cardNumber);
         txn.setIdempotencyKey(idempotencyKey);
         txn.setStatus(status);
-        txn.setCreatedAt(Instant.now());
-        txn.setUpdatedAt(Instant.now());
+        txn.setCreatedAt(new Timestamp(System.currentTimeMillis()));
+        txn.setUpdatedAt(new Timestamp(System.currentTimeMillis()));
         return repository.persist(txn).map(t -> t);
     }
 

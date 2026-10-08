@@ -26,7 +26,6 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import com.sanedge.common.config.RedisService;
 import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.common.enums.Status;
-import com.sanedge.common.exception.InvalidRequestException;
 import com.sanedge.common.exception.ResourceNotFoundException;
 import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.transfer.domain.requests.CreateTransferRequest;
@@ -383,9 +382,10 @@ class TransferCommandServiceImplTest {
                         Long id = 1L;
                         when(transferCommandRepo.restore(1L)).thenReturn(Uni.createFrom().nullItem());
 
-                        assertThatThrownBy(() -> service.restore(id).await().indefinitely())
-                                        .isInstanceOf(InvalidRequestException.class)
-                                        .hasMessageContaining("must be trashed first");
+                        ApiResponse<TransferResponseDeleteAt> response = service.restore(id).await().indefinitely();
+
+                        assertThat(response.status()).isEqualTo("error");
+                        assertThat(response.message()).contains("Transfer not found");
                 }
         }
 
@@ -417,10 +417,10 @@ class TransferCommandServiceImplTest {
                         Long id = 999L;
                         when(transferQueryRepo.findTransferById(999L)).thenReturn(Uni.createFrom().nullItem());
 
-                        assertThatThrownBy(() -> service.deletePermanent(id).await().indefinitely())
-                                        .isInstanceOf(InvalidRequestException.class)
-                                        .hasMessageContaining(
-                                                        "Transfer not found or must be trashed before permanent deletion");
+                        ApiResponse<Boolean> response = service.deletePermanent(id).await().indefinitely();
+
+                        assertThat(response.status()).isEqualTo("error");
+                        assertThat(response.message()).contains("Transfer not found");
                 }
 
                 @Test
@@ -431,10 +431,10 @@ class TransferCommandServiceImplTest {
                                         Status.PENDING);
                         when(transferQueryRepo.findTransferById(1L)).thenReturn(Uni.createFrom().item(activeTransfer));
 
-                        assertThatThrownBy(() -> service.deletePermanent(id).await().indefinitely())
-                                        .isInstanceOf(InvalidRequestException.class)
-                                        .hasMessageContaining(
-                                                        "Transfer not found or must be trashed before permanent deletion");
+                        ApiResponse<Boolean> response = service.deletePermanent(id).await().indefinitely();
+
+                        assertThat(response.status()).isEqualTo("error");
+                        assertThat(response.message()).contains("Transfer not found");
                 }
         }
 

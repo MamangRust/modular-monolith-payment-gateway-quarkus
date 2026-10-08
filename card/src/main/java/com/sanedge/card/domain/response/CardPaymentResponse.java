@@ -40,8 +40,8 @@ public class CardPaymentResponse {
                 .referenceId(payment.referenceId)
                 .status(payment.status)
                 .paidAt(payment.paidAt != null ? payment.paidAt.toString() : null)
-                .createdAt(payment.getCreatedAt() != null ? payment.getCreatedAt().toString() : null)
-                .updatedAt(payment.getUpdatedAt() != null ? payment.getUpdatedAt().toString() : null)
+                .createdAt(payment.getCreatedAt() != null ? payment.getCreatedAt().toInstant().toString() : null)
+                .updatedAt(payment.getUpdatedAt() != null ? payment.getUpdatedAt().toInstant().toString() : null)
                 .build();
     }
 }

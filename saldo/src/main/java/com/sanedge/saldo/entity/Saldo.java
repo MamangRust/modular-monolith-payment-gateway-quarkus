@@ -2,7 +2,7 @@ package com.sanedge.saldo.entity;
 
 import java.sql.Timestamp;
 
-import com.sanedge.saldo.entity.BaseModel;
+import com.sanedge.common.entity.BaseModel;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;

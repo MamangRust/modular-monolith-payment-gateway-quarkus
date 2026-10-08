@@ -3,7 +3,6 @@ package com.sanedge.merchant.service.impl;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -26,8 +25,6 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import com.sanedge.common.config.RedisService;
 import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.common.enums.Status;
-import com.sanedge.common.exception.InvalidRequestException;
-import com.sanedge.common.exception.ResourceAlreadyExistsException;
 import com.sanedge.common.exception.ResourceNotFoundException;
 import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.merchant.domain.requests.CreateMerchantRequest;
@@ -149,31 +146,27 @@ class MerchantCommandServiceImplTest {
         }
 
         @Test
-        void userNotFound_throwsException() {
+        void userNotFound_returnsError() {
             CreateMerchantRequest req = createReq("Merchant", 99L);
             when(userQueryService.findById(any())).thenReturn(Uni.createFrom().nullItem());
-            try {
-                service.createMerchant(req).await().indefinitely();
-                org.assertj.core.api.Assertions.fail("Expected ResourceNotFoundException");
-            } catch (ResourceNotFoundException e) {
-                assertThat(e.getMessage()).contains("User not found");
-            }
+
+            ApiResponse<MerchantResponse> resp = service.createMerchant(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("User not found");
         }
 
         @Test
-        void nameAlreadyExists_throwsException() {
+        void nameAlreadyExists_returnsError() {
             CreateMerchantRequest req = createReq("Existing", 10L);
             pb.user.User.ApiResponseUser userResp = pb.user.User.ApiResponseUser.newBuilder()
                     .setData(pb.user.User.UserResponse.newBuilder().setId(10).build())
                     .build();
             when(userQueryService.findById(any())).thenReturn(Uni.createFrom().item(userResp));
             when(merchantQueryRepo.existsByName("Existing")).thenReturn(Uni.createFrom().item(true));
-            try {
-                service.createMerchant(req).await().indefinitely();
-                org.assertj.core.api.Assertions.fail("Expected ResourceAlreadyExistsException");
-            } catch (ResourceAlreadyExistsException e) {
-                assertThat(e.getMessage()).contains("name already taken");
-            }
+
+            ApiResponse<MerchantResponse> resp = service.createMerchant(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("name already taken");
         }
     }
 
@@ -199,29 +192,25 @@ class MerchantCommandServiceImplTest {
         }
 
         @Test
-        void merchantNotFound_throwsException() {
+        void merchantNotFound_returnsError() {
             UpdateMerchantRequest req = updateReq(999L, "X", null, "SUCCESS");
             when(merchantQueryRepo.findMerchantById(999L)).thenReturn(Uni.createFrom().nullItem());
-            try {
-                service.updateMerchant(req).await().indefinitely();
-                org.assertj.core.api.Assertions.fail("Expected ResourceNotFoundException");
-            } catch (ResourceNotFoundException e) {
-                assertThat(e.getMessage()).contains("Merchant not found");
-            }
+
+            ApiResponse<MerchantResponse> resp = service.updateMerchant(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Merchant not found");
         }
 
         @Test
-        void userNotFoundInUpdate_throwsException() {
+        void userNotFoundInUpdate_returnsError() {
             UpdateMerchantRequest req = updateReq(1L, "Y", 200L, "SUCCESS");
             Merchant existing = createMerchant(1L, "Old", "key");
             when(merchantQueryRepo.findMerchantById(1L)).thenReturn(Uni.createFrom().item(existing));
             when(userQueryService.findById(any())).thenReturn(Uni.createFrom().nullItem());
-            try {
-                service.updateMerchant(req).await().indefinitely();
-                org.assertj.core.api.Assertions.fail("Expected ResourceNotFoundException");
-            } catch (ResourceNotFoundException e) {
-                assertThat(e.getMessage()).contains("User not found");
-            }
+
+            ApiResponse<MerchantResponse> resp = service.updateMerchant(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("User not found");
         }
     }
 
@@ -240,14 +229,12 @@ class MerchantCommandServiceImplTest {
         }
 
         @Test
-        void notFound_throwsException() {
+        void notFound_returnsError() {
             when(merchantCommandRepo.trashed(1L)).thenReturn(Uni.createFrom().nullItem());
-            try {
-                service.trashMerchant(1L).await().indefinitely();
-                org.assertj.core.api.Assertions.fail("Expected ResourceNotFoundException");
-            } catch (ResourceNotFoundException e) {
-                assertThat(e.getMessage()).contains("Merchant not found");
-            }
+
+            ApiResponse<MerchantResponseDeleteAt> resp = service.trashMerchant(1L).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Merchant not found");
         }
     }
 
@@ -263,11 +250,12 @@ class MerchantCommandServiceImplTest {
         }
 
         @Test
-        void notFoundOrNotTrashed_throwsException() {
+        void notFound_returnsError() {
             when(merchantCommandRepo.restore(1L)).thenReturn(Uni.createFrom().nullItem());
-            assertThatThrownBy(() -> service.restoreMerchant(1L).await().indefinitely())
-                    .isInstanceOf(InvalidRequestException.class)
-                    .hasMessageContaining("must be trashed first");
+
+            ApiResponse<MerchantResponseDeleteAt> resp = service.restoreMerchant(1L).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Merchant not found");
         }
     }
 
@@ -276,18 +264,22 @@ class MerchantCommandServiceImplTest {
     class DeleteMerchantTests {
         @Test
         void success() {
+            Merchant existing = createMerchant(1L, "Del", "dk");
+            when(merchantQueryRepo.findMerchantById(1L)).thenReturn(Uni.createFrom().item(existing));
             when(merchantCommandRepo.deletePermanent(1L)).thenReturn(Uni.createFrom().item(true));
+
             ApiResponse<Boolean> resp = service.deleteMerchant(1L).await().indefinitely();
             assertThat(resp.status()).isEqualTo("success");
             assertThat(resp.data()).isTrue();
         }
 
         @Test
-        void failsIfNotTrashed_throwsException() {
-            when(merchantCommandRepo.deletePermanent(1L)).thenReturn(Uni.createFrom().item(false));
-            assertThatThrownBy(() -> service.deleteMerchant(1L).await().indefinitely())
-                    .isInstanceOf(InvalidRequestException.class)
-                    .hasMessageContaining("must be trashed");
+        void notFound_returnsError() {
+            when(merchantQueryRepo.findMerchantById(1L)).thenReturn(Uni.createFrom().nullItem());
+
+            ApiResponse<Boolean> resp = service.deleteMerchant(1L).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Merchant not found");
         }
     }
 

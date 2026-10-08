@@ -72,6 +72,13 @@ public class SaldoCommandGrpcHandler extends MutinySaldoCommandServiceGrpc.Saldo
         com.sanedge.saldo.domain.requests.UpdateSaldoBalance domainReq = new com.sanedge.saldo.domain.requests.UpdateSaldoBalance();
         domainReq.setCardNumber(request.getCardNumber());
         domainReq.setTotalBalance((long) request.getTotalBalance());
+        if (request.getDeltaBalance() != 0) {
+            domainReq.setDeltaBalance((long) request.getDeltaBalance());
+            domainReq.setMinimumBalance((long) request.getMinimumBalance());
+            if (!request.getOperationKey().isEmpty()) {
+                domainReq.setOperationKey(request.getOperationKey());
+            }
+        }
 
         return saldoCommandService.updateSaldoBalance(domainReq)
                 .map(apiResp -> {
@@ -94,6 +101,13 @@ public class SaldoCommandGrpcHandler extends MutinySaldoCommandServiceGrpc.Saldo
         domainReq.setWithdrawAmount((long) request.getWithdrawAmount());
         if (request.getWithdrawTime() != null && !request.getWithdrawTime().isEmpty()) {
             domainReq.setWithdrawTime(java.time.LocalDateTime.parse(request.getWithdrawTime()));
+        }
+        if (request.getDeltaBalance() != 0) {
+            domainReq.setDeltaBalance((long) request.getDeltaBalance());
+            domainReq.setMinimumBalance((long) request.getMinimumBalance());
+            if (!request.getOperationKey().isEmpty()) {
+                domainReq.setOperationKey(request.getOperationKey());
+            }
         }
 
         return saldoCommandService.updateSaldoWithdraw(domainReq)
